@@ -88,11 +88,14 @@ type Platform struct {
 	accessToken           string
 	tokenExpiry           time.Time
 	// AI Card configuration
-	cardTemplateID  string
-	cardTemplateKey string
-	cardThrottleMs  int
-	degradeUntil    time.Time
-	degradeMu       sync.Mutex
+	cardTemplateID         string
+	cardTemplateKey        string
+	cardThrottleMs         int
+	questionCardTemplateID string
+	multicaCLI             string
+	degradeUntil           time.Time
+	degradeMu              sync.Mutex
+	questionPending        sync.Map // outTrackId(string) -> *questionEntry
 	// Per-user notification context: maps staffId → metadata from SendNotification.
 	// Used to recover context when DingTalk truncates quoted content on reply.
 	notifyCtxMu sync.RWMutex
@@ -132,6 +135,14 @@ func New(opts map[string]any) (core.Platform, error) {
 	// AI Card configuration
 	cardTemplateID, _ := opts["card_template_id"].(string)
 	cardTemplateKey, _ := opts["card_template_key"].(string)
+	questionCardTemplateID, _ := opts["question_card_template_id"].(string)
+	if questionCardTemplateID == "" {
+		questionCardTemplateID, _ = opts["question_card_schema_id"].(string)
+	}
+	multicaCLI, _ := opts["multica_cli"].(string)
+	if multicaCLI == "" {
+		multicaCLI, _ = opts["multica_cli_path"].(string)
+	}
 	if cardTemplateKey == "" {
 		cardTemplateKey = "content"
 	}
@@ -145,16 +156,18 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 
 	return &Platform{
-		clientID:              clientID,
-		clientSecret:          clientSecret,
-		robotCode:             robotCode,
-		agentID:               agentID,
-		allowFrom:             allowFrom,
-		shareSessionInChannel: shareSessionInChannel,
-		httpClient:            &http.Client{Timeout: 30 * time.Second},
-		cardTemplateID:        cardTemplateID,
-		cardTemplateKey:       cardTemplateKey,
-		cardThrottleMs:        cardThrottleMs,
+		clientID:               clientID,
+		clientSecret:           clientSecret,
+		robotCode:              robotCode,
+		agentID:                agentID,
+		allowFrom:              allowFrom,
+		shareSessionInChannel:  shareSessionInChannel,
+		httpClient:             &http.Client{Timeout: 30 * time.Second},
+		cardTemplateID:         cardTemplateID,
+		cardTemplateKey:        cardTemplateKey,
+		cardThrottleMs:         cardThrottleMs,
+		questionCardTemplateID: questionCardTemplateID,
+		multicaCLI:             multicaCLI,
 	}, nil
 }
 
@@ -175,6 +188,9 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			p.onRawMessage(df.Data)
 			return payload.NewSuccessDataFrameResponse(), nil
 		})
+
+	// Question-card button callbacks (clicks on the schema card).
+	p.streamClient.RegisterCardCallbackRouter(p.onCardCallback)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.streamCtxCancel = cancel
@@ -768,6 +784,7 @@ var _ core.ImageSender = (*Platform)(nil)
 var _ core.StreamingCardPlatform = (*Platform)(nil)
 var _ core.ReplyContextReconstructor = (*Platform)(nil)
 var _ core.DirectNotifier = (*Platform)(nil)
+var _ core.QuestionCardSender = (*Platform)(nil)
 var _ core.ProactiveContextStorer = (*Platform)(nil)
 
 // CreateStreamingCard creates a new streaming card for the given reply context.

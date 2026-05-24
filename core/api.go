@@ -77,6 +77,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/bind", s.handleRelayBind)
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
 	s.mux.HandleFunc("/notify", s.handleNotify)
+	s.mux.HandleFunc("/cards/question", s.handleQuestionCard)
 
 	return s, nil
 }
@@ -515,6 +516,42 @@ type NotifyRequest struct {
 	Metadata map[string]string `json:"metadata,omitempty"`
 }
 
+// QuestionCardRequest is the JSON body for POST /cards/question.
+type QuestionCardRequest struct {
+	Platform   string            `json:"platform"`
+	UserID     string            `json:"user_id,omitempty"`
+	SessionKey string            `json:"session_key,omitempty"`
+	SchemaID   string            `json:"schema_id,omitempty"`
+	CardData   QuestionCardData  `json:"card_data"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+}
+
+func (s *APIServer) defaultEngine() *Engine {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.engines) == 1 {
+		for _, e := range s.engines {
+			return e
+		}
+	}
+	for _, e := range s.engines {
+		return e
+	}
+	return nil
+}
+
+func (s *APIServer) platformByName(engine *Engine, platformName string) Platform {
+	if engine == nil {
+		return nil
+	}
+	for _, p := range engine.platforms {
+		if p.Name() == platformName {
+			return p
+		}
+	}
+	return nil
+}
+
 // aoneIDRegex extracts an Aone work item ID from strings like "[AONE-32274756]".
 var aoneIDRegex = regexp.MustCompile(`\[AONE-(\d+)\]`)
 
@@ -607,32 +644,13 @@ func (s *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 		req.Platform = "dingtalk"
 	}
 
-	s.mu.RLock()
-	var engine *Engine
-	if len(s.engines) == 1 {
-		for _, e := range s.engines {
-			engine = e
-		}
-	} else {
-		for _, e := range s.engines {
-			engine = e
-			break
-		}
-	}
-	s.mu.RUnlock()
-
+	engine := s.defaultEngine()
 	if engine == nil {
 		http.Error(w, "no engine available", http.StatusServiceUnavailable)
 		return
 	}
 
-	var targetPlatform Platform
-	for _, p := range engine.platforms {
-		if p.Name() == req.Platform {
-			targetPlatform = p
-			break
-		}
-	}
+	targetPlatform := s.platformByName(engine, req.Platform)
 	if targetPlatform == nil {
 		http.Error(w, fmt.Sprintf("platform %q not found", req.Platform), http.StatusNotFound)
 		return
@@ -654,6 +672,67 @@ func (s *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 
 	if err := notifier.SendNotification(ctx, req.UserID, req.Title, req.Content, req.Metadata); err != nil {
 		slog.Warn("notify: send failed", "platform", req.Platform, "user_id", req.UserID, "error", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	apiJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *APIServer) handleQuestionCard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req QuestionCardRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.UserID = strings.TrimSpace(req.UserID)
+	req.SessionKey = strings.TrimSpace(req.SessionKey)
+	req.CardData.WorkspaceID = strings.TrimSpace(req.CardData.WorkspaceID)
+	req.CardData.QuestionID = strings.TrimSpace(req.CardData.QuestionID)
+	req.CardData.Question = strings.TrimSpace(req.CardData.Question)
+	req.CardData.SessionKey = strings.TrimSpace(req.CardData.SessionKey)
+	if req.SessionKey == "" {
+		req.SessionKey = req.CardData.SessionKey
+	}
+	if req.CardData.SessionKey == "" {
+		req.CardData.SessionKey = req.SessionKey
+	}
+	if (req.UserID == "" && req.SessionKey == "") || req.CardData.WorkspaceID == "" || req.CardData.QuestionID == "" || req.CardData.Question == "" {
+		http.Error(w, "user_id or session_key, card_data.workspace_id, card_data.question_id, and card_data.question are required", http.StatusBadRequest)
+		return
+	}
+	if req.Platform == "" {
+		req.Platform = "dingtalk"
+	}
+
+	engine := s.defaultEngine()
+	if engine == nil {
+		http.Error(w, "no engine available", http.StatusServiceUnavailable)
+		return
+	}
+
+	targetPlatform := s.platformByName(engine, req.Platform)
+	if targetPlatform == nil {
+		http.Error(w, fmt.Sprintf("platform %q not found", req.Platform), http.StatusNotFound)
+		return
+	}
+
+	sender, ok := targetPlatform.(QuestionCardSender)
+	if !ok {
+		http.Error(w, fmt.Sprintf("platform %q does not support question cards", req.Platform), http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+
+	if err := sender.SendQuestionCard(ctx, req.UserID, req.SchemaID, req.CardData, req.Metadata); err != nil {
+		slog.Warn("question card: send failed", "platform", req.Platform, "user_id", req.UserID, "question_id", req.CardData.QuestionID, "error", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

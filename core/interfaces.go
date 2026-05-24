@@ -576,3 +576,39 @@ type PreviewStatusUpdater interface {
 type DirectNotifier interface {
 	SendNotification(ctx context.Context, userID, title, content string, metadata map[string]string) error
 }
+
+// QuestionCardOption is a single answer option for an external question card.
+type QuestionCardOption struct {
+	Index       int    `json:"index"`
+	Value       string `json:"value"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// QuestionCardData carries the structured metadata needed by platforms that
+// render an external question card and resolve it through a callback.
+type QuestionCardData struct {
+	WorkspaceID     string               `json:"workspace_id"`
+	IssueID         string               `json:"issue_id"`
+	IssueTitle      string               `json:"issueTitle,omitempty"`
+	IssueIdentifier string               `json:"issue_identifier,omitempty"`
+	QuestionURL     string               `json:"questionUrl,omitempty"`
+	QuestionID      string               `json:"question_id"`
+	Question        string               `json:"question"`
+	UserID          string               `json:"user_id,omitempty"`
+	SessionKey      string               `json:"session_key,omitempty"`
+	TaskID          string               `json:"task_id,omitempty"`
+	AgentID         string               `json:"agent_id"`
+	AgentName       string               `json:"agentName,omitempty"`
+	AgentNameText   string               `json:"agent_name,omitempty"`
+	Header          string               `json:"header,omitempty"`
+	Options         []QuestionCardOption `json:"options,omitempty"`
+	MultiSelect     bool                 `json:"multi_select"`
+	CreatedAt       string               `json:"created_at,omitempty"`
+}
+
+// QuestionCardSender is an optional interface for platforms that can render
+// a direct interactive question card and process its callback.
+type QuestionCardSender interface {
+	SendQuestionCard(ctx context.Context, userID, schemaID string, data QuestionCardData, metadata map[string]string) error
+}
