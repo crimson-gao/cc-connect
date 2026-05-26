@@ -93,6 +93,10 @@ type Platform struct {
 	cardThrottleMs  int
 	degradeUntil    time.Time
 	degradeMu       sync.Mutex
+	// Approval card configuration
+	approvalCardTemplateID string
+	approvalMu             sync.RWMutex
+	pendingApprovals       map[string]pendingApproval
 	// Per-user notification context: maps staffId → metadata from SendNotification.
 	// Used to recover context when DingTalk truncates quoted content on reply.
 	notifyCtxMu sync.RWMutex
@@ -144,17 +148,27 @@ func New(opts map[string]any) (core.Platform, error) {
 		cardThrottleMs = v
 	}
 
+	// Approval card template: defaults to the canonical cc-connect
+	// AskForApprove schema; override via approval_card_template_id when a
+	// deployment ships its own template.
+	approvalCardTemplateID, _ := opts["approval_card_template_id"].(string)
+	if approvalCardTemplateID == "" {
+		approvalCardTemplateID = defaultApprovalCardTemplateID
+	}
+
 	return &Platform{
-		clientID:              clientID,
-		clientSecret:          clientSecret,
-		robotCode:             robotCode,
-		agentID:               agentID,
-		allowFrom:             allowFrom,
-		shareSessionInChannel: shareSessionInChannel,
-		httpClient:            &http.Client{Timeout: 30 * time.Second},
-		cardTemplateID:        cardTemplateID,
-		cardTemplateKey:       cardTemplateKey,
-		cardThrottleMs:        cardThrottleMs,
+		clientID:               clientID,
+		clientSecret:           clientSecret,
+		robotCode:              robotCode,
+		agentID:                agentID,
+		allowFrom:              allowFrom,
+		shareSessionInChannel:  shareSessionInChannel,
+		httpClient:             &http.Client{Timeout: 30 * time.Second},
+		cardTemplateID:         cardTemplateID,
+		cardTemplateKey:        cardTemplateKey,
+		cardThrottleMs:         cardThrottleMs,
+		approvalCardTemplateID: approvalCardTemplateID,
+		pendingApprovals:       make(map[string]pendingApproval),
 	}, nil
 }
 
@@ -175,6 +189,10 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			p.onRawMessage(df.Data)
 			return payload.NewSuccessDataFrameResponse(), nil
 		})
+
+	// Register the interactive-card callback router. Button clicks on the
+	// approval card (and any other cards we deliver) flow through onCardCallback.
+	p.streamClient.RegisterCardCallbackRouter(p.onCardCallback)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	p.streamCtxCancel = cancel
@@ -769,6 +787,7 @@ var _ core.StreamingCardPlatform = (*Platform)(nil)
 var _ core.ReplyContextReconstructor = (*Platform)(nil)
 var _ core.DirectNotifier = (*Platform)(nil)
 var _ core.ProactiveContextStorer = (*Platform)(nil)
+var _ core.InlineButtonSender = (*Platform)(nil)
 
 // CreateStreamingCard creates a new streaming card for the given reply context.
 // Implements core.StreamingCardPlatform.

@@ -960,6 +960,30 @@ app_secret = "your-feishu-app-secret"
 # client_secret = "your-dingtalk-client-secret"
 # allow_from = "*"  # Allowed staff IDs / 允许的员工 ID
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
+# card_template_id = ""             # Optional: AI streaming card template ID (for streamed agent output)
+#                                   # 可选：AI 流式卡片模板 ID（用于流式输出 agent 回复）
+# approval_card_template_id = "fc2ec48d-3d7b-4f9a-a789-9eaa3d0104df.schema"
+#                                   # Permission approval card schema (default shown).
+#                                   # Permission prompts are delivered as an interactive card
+#                                   # with three buttons (allow / allow_all / deny). Public
+#                                   # schema variables (CardData): title, message, createTime,
+#                                   # status, summary. Private schema variable
+#                                   # (UserPrivateData): errorMessage. Callback params:
+#                                   # action ∈ {agree, all_agree, reject}. On a successful
+#                                   # click the callback echoes the action as `status` so the
+#                                   # schema flips to the matching disabled button; on failure
+#                                   # `status` is cleared and `errorMessage` is delivered
+#                                   # privately to the clicker. Override only if your DingTalk
+#                                   # app uses a custom template — set to "" to fall back to
+#                                   # plain-text permission prompts.
+#                                   # 权限审批卡片模板（注释中即为默认值）。权限请求会以交互
+#                                   # 卡片送达，包含允许 / 允许全部 / 拒绝三个按钮。公有变量
+#                                   # (CardData)：title / message / createTime / status /
+#                                   # summary；私有变量 (UserPrivateData)：errorMessage。
+#                                   # 回调参数：action ∈ {agree, all_agree, reject}。成功时
+#                                   # 回写 status = action 使卡片切换为已处理状态；失败时
+#                                   # status 置空，errorMessage 仅对点击者私有可见。如需
+#                                   # 自定义模板请覆盖此值，设为 "" 则退回到纯文本权限提示。
 
 # Telegram (uncomment to enable / 取消注释以启用)
 # 1. Message @BotFather on Telegram, send /newbot to create a bot
