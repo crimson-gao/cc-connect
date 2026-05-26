@@ -65,14 +65,7 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 
 	outTrackId := generateOutTrackID()
 	isGroup := rc.isGroup
-
-	// Build openSpaceId based on conversation type
-	var openSpaceId string
-	if isGroup {
-		openSpaceId = fmt.Sprintf("dtv1.card//IM_GROUP.%s", rc.conversationId)
-	} else {
-		openSpaceId = fmt.Sprintf("dtv1.card//IM_ROBOT.%s", p.robotCode)
-	}
+	openSpaceId := openSpaceIDFor(rc)
 
 	// Build card data
 	cardParamMap := map[string]string{

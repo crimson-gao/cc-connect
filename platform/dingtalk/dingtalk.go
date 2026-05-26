@@ -35,6 +35,23 @@ type replyContext struct {
 	proactive      bool // true when constructed by ReconstructReplyCtx (no sessionWebhook)
 }
 
+// openSpaceIDFor returns the dtv1.card openSpaceId for delivering an
+// interactive card to the conversation described by rc.
+//
+// IM_GROUP space is identified by the group's conversationId.
+// IM_ROBOT (1:1) space is identified by the recipient user's staffId — NOT
+// the robotCode. The robotCode identifies the bot itself; a 1:1 card space
+// is a per-user pairing between bot and recipient, so the recipient's
+// staff ID is the correct space identifier. Using robotCode causes the
+// DingTalk createAndDeliver API to reject the request with
+// "spaceId is illegal".
+func openSpaceIDFor(rc replyContext) string {
+	if rc.isGroup {
+		return fmt.Sprintf("dtv1.card//IM_GROUP.%s", rc.conversationId)
+	}
+	return fmt.Sprintf("dtv1.card//IM_ROBOT.%s", rc.senderStaffId)
+}
+
 // richTextContent mirrors the full structure of the DingTalk "text" JSON field,
 // which the Go SDK's BotCallbackDataTextModel (Content string) silently drops.
 // When a user quotes/replies to a message, DingTalk sends isReplyMsg + repliedMsg.

@@ -132,13 +132,7 @@ func (p *Platform) createApprovalCard(ctx context.Context, rc replyContext, titl
 
 	outTrackId := generateOutTrackID()
 	isGroup := rc.isGroup
-
-	var openSpaceId string
-	if isGroup {
-		openSpaceId = fmt.Sprintf("dtv1.card//IM_GROUP.%s", rc.conversationId)
-	} else {
-		openSpaceId = fmt.Sprintf("dtv1.card//IM_ROBOT.%s", p.robotCode)
-	}
+	openSpaceId := openSpaceIDFor(rc)
 
 	cardParamMap := buildApprovalCardParams(title, message, createTime)
 

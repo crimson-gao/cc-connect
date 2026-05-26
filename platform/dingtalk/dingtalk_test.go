@@ -754,3 +754,39 @@ func TestDingTalkMarkdownTitle_PreservesMulticaMarker(t *testing.T) {
 		t.Errorf("dingtalkMarkdownTitle() = %q, want human title", got)
 	}
 }
+
+func TestOpenSpaceIDFor(t *testing.T) {
+	cases := []struct {
+		name string
+		rc   replyContext
+		want string
+	}{
+		{
+			name: "group uses conversationId",
+			rc:   replyContext{isGroup: true, conversationId: "cidABCxyz==", senderStaffId: "u-1"},
+			want: "dtv1.card//IM_GROUP.cidABCxyz==",
+		},
+		{
+			name: "direct uses senderStaffId (NOT robotCode)",
+			rc:   replyContext{isGroup: false, conversationId: "cid-direct", senderStaffId: "staff-42"},
+			want: "dtv1.card//IM_ROBOT.staff-42",
+		},
+		{
+			name: "direct with empty senderStaffId still emits the IM_ROBOT prefix (caller's responsibility to validate)",
+			rc:   replyContext{isGroup: false, senderStaffId: ""},
+			want: "dtv1.card//IM_ROBOT.",
+		},
+		{
+			name: "group with empty conversationId still emits IM_GROUP prefix",
+			rc:   replyContext{isGroup: true, conversationId: ""},
+			want: "dtv1.card//IM_GROUP.",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := openSpaceIDFor(c.rc); got != c.want {
+				t.Errorf("openSpaceIDFor(%+v) = %q, want %q", c.rc, got, c.want)
+			}
+		})
+	}
+}
