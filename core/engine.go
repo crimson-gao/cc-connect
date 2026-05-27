@@ -3055,38 +3055,6 @@ func (e *Engine) closeAgentSessionWithTimeout(sessionKey string, agentSession Ag
 
 const defaultEventIdleTimeout = 2 * time.Hour
 
-// cardToolEntry stores a tool call record for card content rendering.
-type cardToolEntry struct {
-	Index int
-	Name  string
-	Input string
-}
-
-// buildCardContent constructs the full markdown for the streaming card.
-func buildCardContent(thinking string, tools []cardToolEntry, answer string) string {
-	var sb strings.Builder
-	if thinking != "" {
-		sb.WriteString("💭 **Thinking**\n\n")
-		sb.WriteString(thinking)
-		sb.WriteString("\n\n---\n\n")
-	}
-	for _, t := range tools {
-		sb.WriteString(fmt.Sprintf("🔧 **Tool #%d**: `%s`\n", t.Index, t.Name))
-		if t.Input != "" {
-			sb.WriteString(t.Input)
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-	}
-	if answer != "" {
-		if len(tools) > 0 || thinking != "" {
-			sb.WriteString("---\n\n")
-		}
-		sb.WriteString(answer)
-	}
-	return sb.String()
-}
-
 // unsolicitedReaderStopTimeout bounds how long stopUnsolicitedReader waits
 // for the reader goroutine to exit. The reader is structured so its iterations
 // are short (blocking adapter calls like RespondPermission are offloaded), so
@@ -3429,9 +3397,34 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	// Streaming card: aggregate entire turn into a single updatable card.
 	var streamCard StreamingCard
-	var cardToolCalls []cardToolEntry  // track tool calls for card content
-	var cardThinkingText string        // latest thinking text
 	var cardAnswerText strings.Builder // accumulated answer text
+	failStreamCard := func(content string) bool {
+		if streamCard == nil || streamCard.Failed() {
+			return false
+		}
+		if failer, ok := streamCard.(StreamingCardFailure); ok {
+			if err := failer.Fail(e.ctx, content); err != nil {
+				slog.Error("streaming card failure update failed", "error", err)
+				return false
+			}
+			return true
+		}
+		if err := streamCard.Finalize(e.ctx, content); err != nil {
+			slog.Error("streaming card failure finalize failed", "error", err)
+			return false
+		}
+		return true
+	}
+	finalizeStreamCard := func(content string) bool {
+		if streamCard == nil || streamCard.Failed() {
+			return false
+		}
+		if err := streamCard.Finalize(e.ctx, content); err != nil {
+			slog.Error("streaming card finalize failed", "error", err)
+			return false
+		}
+		return true
+	}
 
 	if scp, ok := state.platform.(StreamingCardPlatform); ok {
 		if sc, err := scp.CreateStreamingCard(e.ctx, state.replyCtx); err != nil {
@@ -3495,7 +3488,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				state.mu.Lock()
 				p := state.platform
 				state.mu.Unlock()
-				e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), err))
+				userMsg := fmt.Sprintf(e.i18n.T(MsgError), err)
+				if !failStreamCard(userMsg) {
+					e.send(p, replyCtx, userMsg)
+				}
 				return
 			}
 			continue
@@ -3508,7 +3504,10 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.eventsNeedResync = true
 			p := state.platform
 			state.mu.Unlock()
-			e.send(p, replyCtx, fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)"))
+			userMsg := fmt.Sprintf(e.i18n.T(MsgError), "agent session timed out (no response)")
+			if !failStreamCard(userMsg) {
+				e.send(p, replyCtx, userMsg)
+			}
 			e.cleanupInteractiveState(sessionKey, state)
 			return
 		case <-e.ctx.Done():
@@ -3523,6 +3522,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			state.mu.Lock()
 			state.eventsNeedResync = true
 			state.mu.Unlock()
+			failStreamCard(e.i18n.T(MsgExecutionStopped))
 			return
 		}
 
@@ -3560,6 +3560,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		switch event.Type {
 		case EventThinking:
+			if streamCard != nil {
+				continue
+			}
 			if isEllipsisOnly(event.Content) {
 				break
 			}
@@ -3619,13 +3622,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				silentHold = false
 			}
 			if e.display.ThinkingMessages && event.Content != "" {
-				// --- StreamingCard path ---
-				if streamCard != nil && !streamCard.Failed() {
-					cardThinkingText = truncateIf(event.Content, e.display.ThinkingMaxLen)
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
-					continue // skip original independent message sending
-				}
-				// --- Original path (fallback) ---
 				// Flush accumulated text segment before thinking display
 				previewActive := sp.canPreview()
 				if len(textParts) > segmentStart {
@@ -3653,6 +3649,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 		case EventToolUse:
 			toolCount++
+			if streamCard != nil {
+				continue
+			}
 			if hasRichCard {
 				// When tool messages are suppressed, skip card updates on tool events.
 				if !e.display.ToolMessages {
@@ -3706,34 +3705,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				silentHold = false
 			}
 			if e.display.ToolMessages {
-				// --- StreamingCard path ---
-				if streamCard != nil && !streamCard.Failed() {
-					toolInput := event.ToolInput
-					var formattedInput string
-					if toolInput == "" {
-						formattedInput = ""
-					} else if strings.Contains(toolInput, "```") {
-						formattedInput = toolInput
-					} else if strings.Contains(toolInput, "\n") || utf8.RuneCountInString(toolInput) > 200 {
-						lang := toolCodeLang(event.ToolName, toolInput)
-						formattedInput = fmt.Sprintf("```%s\n%s\n```", lang, toolInput)
-					} else {
-						switch event.ToolName {
-						case "shell", "run_shell_command", "Bash":
-							formattedInput = fmt.Sprintf("```bash\n%s\n```", toolInput)
-						default:
-							formattedInput = fmt.Sprintf("`%s`", toolInput)
-						}
-					}
-					cardToolCalls = append(cardToolCalls, cardToolEntry{
-						Index: toolCount,
-						Name:  event.ToolName,
-						Input: formattedInput,
-					})
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
-					continue // skip original independent message sending
-				}
-				// --- Original path (fallback) ---
 				// Flush accumulated text segment before tool display
 				previewActive := sp.canPreview()
 				if len(textParts) > segmentStart {
@@ -3778,6 +3749,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			}
 
 		case EventToolResult:
+			if streamCard != nil {
+				continue
+			}
 			if e.display.ToolMessages {
 				result := strings.TrimSpace(event.ToolResult)
 				if result == "" {
@@ -3827,11 +3801,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 		case EventText:
 			if event.Content != "" && !isEllipsisOnly(event.Content) {
 				if streamCard != nil && !streamCard.Failed() {
-					// Streaming card path (e.g. DingTalk AI Card): aggregate
-					// answer text into a single updatable card message.
+					// Streaming cards only show assistant answer text. Thinking,
+					// tool calls, and tool results are intentionally suppressed.
 					textParts = append(textParts, event.Content) // always accumulate for history
 					cardAnswerText.WriteString(event.Content)
-					_ = streamCard.Update(e.ctx, buildCardContent(cardThinkingText, cardToolCalls, cardAnswerText.String()))
+					_ = streamCard.Update(e.ctx, cardAnswerText.String())
 				} else {
 					if len(textParts) == 0 {
 						if hasRichCard {
@@ -4109,11 +4083,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// --- StreamingCard path ---
 			if streamCard != nil && !streamCard.Failed() {
 				sp.finish("") // cleanup preview (should be no-op if card was active)
-				// Build final card content with full response
-				finalContent := buildCardContent(cardThinkingText, cardToolCalls, fullResponse)
-				if err := streamCard.Finalize(e.ctx, finalContent); err != nil {
-					slog.Error("streaming card finalize failed, sending fallback", "error", err)
-					// Fallback: send the response as a normal message
+				if !finalizeStreamCard(fullResponse) {
 					for _, chunk := range splitMessage(fullResponse, maxPlatformMessageLen) {
 						if err := sendWorkspaceWithError(p, replyCtx, chunk); err != nil {
 							return
@@ -4315,8 +4285,6 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 				// Reset streaming card state for the next turn
 				streamCard = nil
-				cardToolCalls = nil
-				cardThinkingText = ""
 				cardAnswerText.Reset()
 
 				// Try to create a new streaming card for the queued turn
@@ -4389,6 +4357,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 				}
 			}
+			userMsg := fmt.Sprintf(e.i18n.T(MsgError), "agent error")
 			if event.Error != nil {
 				errMsg := event.Error.Error()
 				slog.Error("agent error", "error", event.Error)
@@ -4398,14 +4367,18 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					Platform:   p.Name(),
 					Error:      event.Error.Error(),
 				})
-				userMsg := fmt.Sprintf(e.i18n.T(MsgError), errMsg)
+				userMsg = fmt.Sprintf(e.i18n.T(MsgError), errMsg)
 				for _, h := range agentErrorHandlers {
 					if strings.Contains(errMsg, h.contains) {
 						userMsg = e.i18n.T(h.msgKey)
 						break
 					}
 				}
-				e.send(p, replyCtx, userMsg)
+			}
+			if event.Error != nil || streamCard != nil {
+				if !failStreamCard(userMsg) && event.Error != nil {
+					e.send(p, replyCtx, userMsg)
+				}
 			}
 			// Only drop queued messages if the agent session is dead.
 			// Some agents (e.g. Codex) emit EventError for per-turn failures
@@ -4425,6 +4398,11 @@ channelClosed:
 	state.mu.Unlock()
 	e.notifyDroppedQueuedMessages(state, fmt.Errorf("agent process exited"))
 	e.cleanupInteractiveState(sessionKey, state)
+
+	exitMsg := fmt.Sprintf(e.i18n.T(MsgError), "agent process exited")
+	if len(textParts) == 0 {
+		failStreamCard(exitMsg)
+	}
 
 	if len(textParts) > 0 {
 		state.mu.Lock()
@@ -4446,6 +4424,13 @@ channelClosed:
 				return
 			}
 			fullResponse = stripped
+		}
+
+		if streamCard != nil {
+			sp.discard()
+			if failStreamCard(strings.TrimSpace(fullResponse + "\n\n" + exitMsg)) {
+				return
+			}
 		}
 
 		e.hooks.Emit(HookEvent{

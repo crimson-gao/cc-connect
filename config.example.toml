@@ -960,8 +960,13 @@ app_secret = "your-feishu-app-secret"
 # client_secret = "your-dingtalk-client-secret"
 # allow_from = "*"  # Allowed staff IDs / 允许的员工 ID
 # share_session_in_channel = false  # If true, all users in a group share one agent session / 群聊共享会话
-# card_template_id = ""             # Optional: AI streaming card template ID (for streamed agent output)
-#                                   # 可选：AI 流式卡片模板 ID（用于流式输出 agent 回复）
+# dynamic_card = true               # Enable AI streaming card replies (default true); set false for plain markdown messages
+#                                   # 启用 AI 流式卡片回复（默认 true）；设为 false 则回退普通 Markdown 消息
+# card_template_id = ""             # Optional: custom AI streaming card template ID; empty uses DingTalk public AI Card template
+#                                   # 可选：自定义 AI 流式卡片模板 ID；留空使用钉钉公开 AI 卡片模板
+# card_template_key = ""            # Optional: text variable name; empty uses "msgContent" for public template, "content" for custom template
+#                                   # 可选：文本变量名；留空时公开模板使用 "msgContent"，自定义模板使用 "content"
+# card_throttle_ms = 300            # Min interval between card updates per turn / 每轮卡片更新的最小间隔毫秒数
 # approval_card_template_id = "fc2ec48d-3d7b-4f9a-a789-9eaa3d0104df.schema"
 #                                   # Permission approval card schema (default shown).
 #                                   # Permission prompts are delivered as an interactive card

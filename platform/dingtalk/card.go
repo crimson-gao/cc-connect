@@ -6,27 +6,38 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
 
+const (
+	cardFlowProcessing = "1"
+	cardFlowInputing   = "2"
+	cardFlowFinished   = "3"
+)
+
 // aiCard implements core.StreamingCard for DingTalk AI Card streaming.
 type aiCard struct {
 	cardInstanceId string
 	outTrackId     string
-	templateKey    string // 卡片模板变量名，默认 "content"
+	templateKey    string
+	defaultTpl     bool
 	platform       *Platform
 
 	mu              sync.Mutex
 	state           string // "processing" | "finished" | "failed"
 	lastSentContent string
 	lastSentAt      time.Time
+	inputingStarted bool
 
 	// 节流控制（single-flight + latest-wins 语义）
 	throttleMs     int
@@ -38,6 +49,7 @@ type aiCard struct {
 
 // Ensure aiCard implements core.StreamingCard
 var _ core.StreamingCard = (*aiCard)(nil)
+var _ core.StreamingCardFailure = (*aiCard)(nil)
 
 // generateOutTrackID generates a unique outTrackId for AI Card.
 func generateOutTrackID() string {
@@ -67,10 +79,18 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 	isGroup := rc.isGroup
 	openSpaceId := openSpaceIDFor(rc)
 
-	// Build card data
 	cardParamMap := map[string]string{
-		"config":         `{"autoLayout":true,"enableForward":true}`,
+		"config":          `{"autoLayout":true,"enableForward":true}`,
 		p.cardTemplateKey: "",
+	}
+	if p.useDefaultTemplate {
+		cardParamMap = map[string]string{
+			"flowStatus":        cardFlowProcessing,
+			p.cardTemplateKey:   "",
+			"staticMsgContent":  "",
+			"sys_full_json_obj": `{"order":["` + p.cardTemplateKey + `"]}`,
+			"config":            `{"autoLayout":true}`,
+		}
 	}
 
 	payload := map[string]any{
@@ -79,11 +99,11 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 		"cardData": map[string]any{
 			"cardParamMap": cardParamMap,
 		},
-		"callbackType":            "STREAM",
-		"imGroupOpenSpaceModel":   map[string]any{"supportForward": true},
-		"imRobotOpenSpaceModel":   map[string]any{"supportForward": true},
-		"openSpaceId":             openSpaceId,
-		"userIdType":              1,
+		"callbackType":          "STREAM",
+		"imGroupOpenSpaceModel": map[string]any{"supportForward": true},
+		"imRobotOpenSpaceModel": map[string]any{"supportForward": true},
+		"openSpaceId":           openSpaceId,
+		"userIdType":            1,
 	}
 
 	// Set delivery model based on conversation type
@@ -116,8 +136,14 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-acs-dingtalk-access-token", token)
 
-	slog.Debug("dingtalk: creating AI card", "outTrackId", outTrackId, "isGroup", isGroup)
+	slog.Debug("dingtalk: creating AI card",
+		"outTrackId", outTrackId,
+		"isGroup", isGroup,
+		"defaultTpl", p.useDefaultTemplate)
 
+	if err := cardLimiter.wait(reqCtx); err != nil {
+		return nil, fmt.Errorf("rate limit wait: %w", err)
+	}
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("do request: %w", err)
@@ -200,6 +226,7 @@ func (p *Platform) createAICard(ctx context.Context, rc replyContext) (*aiCard, 
 		cardInstanceId: cardInstanceId,
 		outTrackId:     resolvedOutTrackId,
 		templateKey:    p.cardTemplateKey,
+		defaultTpl:     p.useDefaultTemplate,
 		platform:       p,
 		state:          "processing",
 		throttleMs:     p.cardThrottleMs,
@@ -286,9 +313,13 @@ func (c *aiCard) flush(ctx context.Context) {
 	c.inFlight = false
 	if err != nil {
 		slog.Error("dingtalk: AI card stream update failed", "error", err)
-		// Check pending content that arrived during in-flight
-		if c.pendingContent != "" {
+		if isTransientCardError(err) && c.state != "failed" {
+			if c.pendingContent == "" {
+				c.pendingContent = content
+			}
 			c.scheduleFlushLocked()
+		} else {
+			c.markFailedLocked()
 		}
 	} else {
 		c.lastSentContent = content
@@ -303,18 +334,42 @@ func (c *aiCard) flush(ctx context.Context) {
 
 // doStream sends content to the DingTalk streaming API.
 func (c *aiCard) doStream(ctx context.Context, content string, isFinalize bool) error {
+	return c.doStreamWithErrorFlag(ctx, content, isFinalize, false)
+}
+
+func (c *aiCard) doStreamWithErrorFlag(ctx context.Context, content string, isFinalize bool, isError bool) error {
+	if c.defaultTpl {
+		c.mu.Lock()
+		needInputing := !c.inputingStarted
+		c.mu.Unlock()
+		if needInputing {
+			if err := c.putFlowStatus(ctx, cardFlowInputing, content); err != nil {
+				slog.Warn("dingtalk: AI card INPUTING transition failed", "error", err)
+			} else {
+				c.mu.Lock()
+				c.inputingStarted = true
+				c.mu.Unlock()
+			}
+		}
+	}
+
 	token, err := c.platform.getAccessToken()
 	if err != nil {
 		return fmt.Errorf("get access token: %w", err)
 	}
 
+	streamContent := normalizeForCard(content)
+	if !isFinalize {
+		streamContent = strings.TrimRight(streamContent, "\n ")
+	}
+
 	payload := map[string]any{
 		"outTrackId": c.outTrackId,
 		"key":        c.templateKey,
-		"content":    content,
+		"content":    streamContent,
 		"isFull":     true,
 		"isFinalize": isFinalize,
-		"isError":    false,
+		"isError":    isError,
 		"guid":       generateGUID(),
 	}
 
@@ -338,9 +393,13 @@ func (c *aiCard) doStream(ctx context.Context, content string, isFinalize bool) 
 
 	slog.Debug("dingtalk: streaming AI card",
 		"outTrackId", c.outTrackId,
-		"contentLen", len(content),
-		"isFinalize", isFinalize)
+		"contentLen", len(streamContent),
+		"isFinalize", isFinalize,
+		"isError", isError)
 
+	if err := cardLimiter.wait(reqCtx); err != nil {
+		return fmt.Errorf("rate limit wait: %w", err)
+	}
 	resp, err := c.platform.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("do request: %w", err)
@@ -355,21 +414,87 @@ func (c *aiCard) doStream(ctx context.Context, content string, isFinalize bool) 
 		"isFinalize", isFinalize)
 
 	if resp.StatusCode != http.StatusOK {
+		if isQpsLimit(resp.StatusCode, respBody) {
+			cardLimiter.triggerBackoff()
+			slog.Warn("dingtalk: AI card stream hit QPS limit, backing off", "status", resp.StatusCode)
+			return &cardAPIError{op: "stream AI card", status: resp.StatusCode, body: string(respBody), transient: true}
+		}
 		slog.Error("dingtalk: stream AI card failed",
 			"status", resp.StatusCode,
 			"body", string(respBody))
 		// Check if we should trigger degrade
 		if resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			c.platform.activateCardDegrade(fmt.Sprintf("card.stream:%d", resp.StatusCode))
-			c.mu.Lock()
-			c.state = "failed"
-			close(c.done)
-			c.mu.Unlock()
 		}
-		return fmt.Errorf("stream AI card: status=%d, body=%s", resp.StatusCode, string(respBody))
+		return &cardAPIError{op: "stream AI card", status: resp.StatusCode, body: string(respBody)}
 	}
 
 	slog.Debug("dingtalk: AI card streamed successfully", "isFinalize", isFinalize)
+	return nil
+}
+
+// putFlowStatus updates the public template's flowStatus parameter via
+// PUT /v1.0/card/instances. It is only used with DingTalk's public template.
+func (c *aiCard) putFlowStatus(ctx context.Context, status, content string) error {
+	token, err := c.platform.getAccessToken()
+	if err != nil {
+		return fmt.Errorf("get access token: %w", err)
+	}
+
+	body := map[string]any{
+		"outTrackId": c.outTrackId,
+		"cardData": map[string]any{
+			"cardParamMap": map[string]string{
+				"flowStatus":        status,
+				c.templateKey:       normalizeForCard(content),
+				"staticMsgContent":  "",
+				"sys_full_json_obj": `{"order":["` + c.templateKey + `"]}`,
+				"config":            `{"autoLayout":true}`,
+			},
+		},
+		"cardUpdateOptions": map[string]any{
+			"updateCardDataByKey": true,
+		},
+	}
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPut,
+		"https://api.dingtalk.com/v1.0/card/instances",
+		bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-acs-dingtalk-access-token", token)
+
+	if err := cardLimiter.wait(reqCtx); err != nil {
+		return fmt.Errorf("rate limit wait: %w", err)
+	}
+	resp, err := c.platform.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		if isQpsLimit(resp.StatusCode, respBody) {
+			cardLimiter.triggerBackoff()
+			return &cardAPIError{op: "update AI card flowStatus", status: resp.StatusCode, body: string(respBody), transient: true}
+		}
+		if resp.StatusCode == 403 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			c.platform.activateCardDegrade(fmt.Sprintf("card.flow:%d", resp.StatusCode))
+		}
+		return &cardAPIError{op: "update AI card flowStatus", status: resp.StatusCode, body: string(respBody)}
+	}
+
+	slog.Debug("dingtalk: AI card flowStatus updated", "status", status)
 	return nil
 }
 
@@ -404,23 +529,66 @@ func (c *aiCard) Finalize(ctx context.Context, content string) error {
 	c.mu.Unlock()
 
 	err := c.doStream(ctx, content, true)
+	if err == nil && c.defaultTpl {
+		if ferr := c.putFlowStatus(ctx, cardFlowFinished, content); ferr != nil {
+			slog.Warn("dingtalk: AI card FINISHED transition failed", "error", ferr)
+			err = ferr
+		}
+	}
 
 	c.mu.Lock()
 	c.inFlight = false
 	if err != nil {
-		c.state = "failed"
+		c.markFailedLocked()
 	} else {
 		c.state = "finished"
 		c.lastSentContent = content
 		c.lastSentAt = time.Now()
 	}
-	select {
-	case <-c.done:
-	default:
-		close(c.done)
-	}
+	c.closeDoneLocked()
 	c.mu.Unlock()
 
+	return err
+}
+
+// Fail writes an error payload into the card and stops the public template's
+// loading state. Callers fall back to a normal message if this fails.
+func (c *aiCard) Fail(ctx context.Context, content string) error {
+	c.mu.Lock()
+	if c.timer != nil {
+		c.timer.Stop()
+		c.timer = nil
+	}
+	c.pendingContent = ""
+	if c.state == "finished" || c.state == "failed" {
+		c.mu.Unlock()
+		return nil
+	}
+	for c.inFlight {
+		c.mu.Unlock()
+		select {
+		case <-c.done:
+			return nil
+		case <-time.After(100 * time.Millisecond):
+		}
+		c.mu.Lock()
+	}
+
+	c.inFlight = true
+	c.mu.Unlock()
+
+	err := c.doStreamWithErrorFlag(ctx, content, true, true)
+	if err == nil && c.defaultTpl {
+		if ferr := c.putFlowStatus(ctx, cardFlowFinished, content); ferr != nil {
+			slog.Warn("dingtalk: AI card failure FINISHED transition failed", "error", ferr)
+			err = ferr
+		}
+	}
+
+	c.mu.Lock()
+	c.inFlight = false
+	c.markFailedLocked()
+	c.mu.Unlock()
 	return err
 }
 
@@ -429,6 +597,19 @@ func (c *aiCard) Failed() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.state == "failed"
+}
+
+func (c *aiCard) closeDoneLocked() {
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+}
+
+func (c *aiCard) markFailedLocked() {
+	c.state = "failed"
+	c.closeDoneLocked()
 }
 
 // isCardDegraded returns true if card API is temporarily degraded.
@@ -446,4 +627,222 @@ func (p *Platform) activateCardDegrade(reason string) {
 	slog.Warn("dingtalk: AI card API degraded",
 		"reason", reason,
 		"until", p.degradeUntil.Format(time.RFC3339))
+}
+
+type cardAPIError struct {
+	op        string
+	status    int
+	body      string
+	transient bool
+}
+
+func (e *cardAPIError) Error() string {
+	return fmt.Sprintf("%s: status=%d, body=%s", e.op, e.status, e.body)
+}
+
+func isTransientCardError(err error) bool {
+	var apiErr *cardAPIError
+	return errors.As(err, &apiErr) && apiErr.transient
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// QPS limiter (process-wide, shared across all DingTalk Platform instances)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type tokenBucket struct {
+	mu            sync.Mutex
+	tokens        float64
+	maxTokens     float64
+	refillPerSec  float64
+	lastRefill    time.Time
+	backoffUntil  time.Time
+	backoffWindow time.Duration
+	queue         chan struct{}
+}
+
+func newTokenBucket(maxTokens, refillPerSec float64, backoff time.Duration) *tokenBucket {
+	return &tokenBucket{
+		tokens:        maxTokens,
+		maxTokens:     maxTokens,
+		refillPerSec:  refillPerSec,
+		lastRefill:    time.Now(),
+		backoffWindow: backoff,
+		queue:         make(chan struct{}, 1),
+	}
+}
+
+func (b *tokenBucket) wait(ctx context.Context) error {
+	select {
+	case b.queue <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-b.queue }()
+
+	for {
+		b.mu.Lock()
+		now := time.Now()
+		if now.Before(b.backoffUntil) {
+			delay := b.backoffUntil.Sub(now)
+			b.mu.Unlock()
+			select {
+			case <-time.After(delay):
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+
+		elapsed := now.Sub(b.lastRefill).Seconds()
+		if elapsed > 0 {
+			b.tokens += elapsed * b.refillPerSec
+			if b.tokens > b.maxTokens {
+				b.tokens = b.maxTokens
+			}
+			b.lastRefill = now
+		}
+		if b.tokens >= 1 {
+			b.tokens--
+			b.mu.Unlock()
+			return nil
+		}
+
+		need := 1 - b.tokens
+		wait := time.Duration((need/b.refillPerSec)*1000) * time.Millisecond
+		b.mu.Unlock()
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (b *tokenBucket) triggerBackoff() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	end := time.Now().Add(b.backoffWindow)
+	b.backoffUntil = end
+	b.tokens = 0
+	b.lastRefill = end
+}
+
+var cardLimiter = newTokenBucket(20, 20, 2*time.Second)
+
+var qpsLimitRe = regexp.MustCompile(`"code"\s*:\s*"[^"]*QpsLimit[^"]*"`)
+
+func isQpsLimit(status int, body []byte) bool {
+	return status == http.StatusForbidden && qpsLimitRe.Match(body)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Markdown normalization for DingTalk AI Card
+// ─────────────────────────────────────────────────────────────────────────────
+
+var (
+	tableDividerRe       = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(\|?\s*:?-+:?\s*)+\|?\s*$`)
+	tableRowRe           = regexp.MustCompile(`^\s*\|?.*\|.*\|?\s*$`)
+	mdBlockStartRe       = regexp.MustCompile(`^(\s{0,3}(?:[-*+]|\d+[.)])[ ])|(\s{0,3}\|)|(\s{0,3}#{1,6}\s)|(\s{0,3}(?:[-*_])\s*(?:[-*_])\s*(?:[-*_]))`)
+	fenceRe              = regexp.MustCompile(`^\s{0,3}` + "```")
+	quoteRe              = regexp.MustCompile(`^\s{0,3}>\s?`)
+	crlfNormalizerRegexp = regexp.MustCompile(`\r\n?`)
+)
+
+func normalizeForCard(content string) string {
+	return fixNewlines(ensureTableBlankLines(content))
+}
+
+func ensureTableBlankLines(text string) string {
+	text = crlfNormalizerRegexp.ReplaceAllString(text, "\n")
+	lines := strings.Split(text, "\n")
+	out := make([]string, 0, len(lines))
+
+	isDivider := func(line string) bool {
+		return strings.Contains(line, "|") && tableDividerRe.MatchString(line)
+	}
+
+	for i, line := range lines {
+		next := ""
+		if i+1 < len(lines) {
+			next = lines[i+1]
+		}
+		if i > 0 &&
+			tableRowRe.MatchString(line) &&
+			isDivider(next) &&
+			strings.TrimSpace(lines[i-1]) != "" &&
+			!tableRowRe.MatchString(lines[i-1]) {
+			out = append(out, "")
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func fixNewlines(text string) string {
+	text = crlfNormalizerRegexp.ReplaceAllString(text, "\n")
+	rawLines := strings.Split(text, "\n")
+
+	merged := make([]string, 0, len(rawLines))
+	pendingQuotes := []string{}
+	inCode := false
+	flushQuotes := func() {
+		if len(pendingQuotes) > 0 {
+			merged = append(merged, strings.Join(pendingQuotes, "<br>"))
+			pendingQuotes = pendingQuotes[:0]
+		}
+	}
+
+	for _, line := range rawLines {
+		isFence := fenceRe.MatchString(line)
+		if inCode {
+			flushQuotes()
+			merged = append(merged, line)
+			if isFence {
+				inCode = false
+			}
+			continue
+		}
+		if isFence {
+			flushQuotes()
+			merged = append(merged, line)
+			inCode = true
+			continue
+		}
+		if quoteRe.MatchString(line) {
+			if len(pendingQuotes) == 0 {
+				pendingQuotes = append(pendingQuotes, line)
+			} else {
+				pendingQuotes = append(pendingQuotes, quoteRe.ReplaceAllString(line, ""))
+			}
+		} else {
+			flushQuotes()
+			merged = append(merged, line)
+		}
+	}
+	flushQuotes()
+
+	inCode = false
+	var sb strings.Builder
+	for i, line := range merged {
+		nextInCode := inCode
+		if fenceRe.MatchString(line) {
+			nextInCode = !inCode
+		}
+		sb.WriteString(line)
+		if i < len(merged)-1 {
+			next := merged[i+1]
+			keepNewline := nextInCode ||
+				line == "" ||
+				next == "" ||
+				fenceRe.MatchString(next) ||
+				mdBlockStartRe.MatchString(next)
+			if keepNewline {
+				sb.WriteByte('\n')
+			} else {
+				sb.WriteString("<br>")
+			}
+		}
+		inCode = nextInCode
+	}
+	return sb.String()
 }

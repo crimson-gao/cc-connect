@@ -105,11 +105,13 @@ type Platform struct {
 	accessToken           string
 	tokenExpiry           time.Time
 	// AI Card configuration
-	cardTemplateID  string
-	cardTemplateKey string
-	cardThrottleMs  int
-	degradeUntil    time.Time
-	degradeMu       sync.Mutex
+	cardTemplateID     string
+	cardTemplateKey    string
+	cardThrottleMs     int
+	useDefaultTemplate bool
+	dynamicCard        bool
+	degradeUntil       time.Time
+	degradeMu          sync.Mutex
 	// Approval card configuration
 	approvalCardTemplateID string
 	approvalMu             sync.RWMutex
@@ -119,6 +121,11 @@ type Platform struct {
 	notifyCtxMu sync.RWMutex
 	notifyCtx   map[string]notifyEntry
 }
+
+// DefaultCardTemplateID is DingTalk's public AI Card template for streaming AI
+// replies. It lets deployments use dynamic cards without creating a custom
+// template in the DingTalk console.
+const DefaultCardTemplateID = "02fcf2f4-5e02-4a85-b672-46d1f715543e.schema"
 
 func New(opts map[string]any) (core.Platform, error) {
 	clientID, _ := opts["client_id"].(string)
@@ -150,11 +157,26 @@ func New(opts map[string]any) (core.Platform, error) {
 	}
 	// agent_id can be 0 for testing, but will fail in production
 
-	// AI Card configuration
+	// AI Card configuration. Streaming cards are enabled by default and use
+	// DingTalk's public AI Card template unless a custom card_template_id is set.
+	dynamicCard := true
+	if v, ok := opts["dynamic_card"].(bool); ok {
+		dynamicCard = v
+	}
+
 	cardTemplateID, _ := opts["card_template_id"].(string)
+	useDefaultTemplate := cardTemplateID == ""
+	if useDefaultTemplate {
+		cardTemplateID = DefaultCardTemplateID
+	}
+
 	cardTemplateKey, _ := opts["card_template_key"].(string)
 	if cardTemplateKey == "" {
-		cardTemplateKey = "content"
+		if useDefaultTemplate {
+			cardTemplateKey = "msgContent"
+		} else {
+			cardTemplateKey = "content"
+		}
 	}
 	cardThrottleMs := 300
 	if v, ok := opts["card_throttle_ms"].(float64); ok && v > 0 {
@@ -184,6 +206,8 @@ func New(opts map[string]any) (core.Platform, error) {
 		cardTemplateID:         cardTemplateID,
 		cardTemplateKey:        cardTemplateKey,
 		cardThrottleMs:         cardThrottleMs,
+		useDefaultTemplate:     useDefaultTemplate,
+		dynamicCard:            dynamicCard,
 		approvalCardTemplateID: approvalCardTemplateID,
 		pendingApprovals:       make(map[string]pendingApproval),
 	}, nil
@@ -809,6 +833,9 @@ var _ core.InlineButtonSender = (*Platform)(nil)
 // CreateStreamingCard creates a new streaming card for the given reply context.
 // Implements core.StreamingCardPlatform.
 func (p *Platform) CreateStreamingCard(ctx context.Context, replyCtx any) (core.StreamingCard, error) {
+	if !p.dynamicCard {
+		return nil, fmt.Errorf("dingtalk: dynamic_card disabled")
+	}
 	if p.cardTemplateID == "" {
 		return nil, fmt.Errorf("dingtalk: card_template_id not configured")
 	}

@@ -543,6 +543,12 @@ type StreamingCard interface {
 	Failed() bool
 }
 
+// StreamingCardFailure is implemented by streaming cards that can render a
+// terminal error state instead of leaving an in-progress card behind.
+type StreamingCardFailure interface {
+	Fail(ctx context.Context, content string) error
+}
+
 // StreamingCardPlatform is an optional interface for platforms that support
 // aggregating an entire agent turn into a single updatable card message
 // (e.g. DingTalk AI Card). When the engine detects this interface, it

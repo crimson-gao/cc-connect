@@ -10858,6 +10858,7 @@ type stubStreamingCardPlatform struct {
 	stubPlatformEngine
 	cardCreated bool
 	cardFail    bool // when true, CreateStreamingCard returns an error
+	card        *stubStreamingCard
 }
 
 func (p *stubStreamingCardPlatform) CreateStreamingCard(_ context.Context, _ any) (StreamingCard, error) {
@@ -10865,15 +10866,124 @@ func (p *stubStreamingCardPlatform) CreateStreamingCard(_ context.Context, _ any
 		return nil, fmt.Errorf("stub: card_template_id not configured")
 	}
 	p.cardCreated = true
-	return &stubStreamingCard{}, nil
+	card := &stubStreamingCard{}
+	p.card = card
+	return card, nil
 }
 
-// stubStreamingCard is a minimal StreamingCard for tests.
-type stubStreamingCard struct{}
+type stubStreamingCard struct {
+	mu      sync.Mutex
+	updates []string
+	final   string
+	fail    string
+	failed  bool
+}
 
-func (c *stubStreamingCard) Update(_ context.Context, _ string) error { return nil }
-func (c *stubStreamingCard) Finalize(_ context.Context, _ string) error { return nil }
-func (c *stubStreamingCard) Failed() bool                                { return false }
+func (c *stubStreamingCard) Update(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.updates = append(c.updates, content)
+	return nil
+}
+func (c *stubStreamingCard) Finalize(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.final = content
+	return nil
+}
+func (c *stubStreamingCard) Fail(_ context.Context, content string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fail = content
+	c.failed = true
+	return nil
+}
+func (c *stubStreamingCard) Failed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed
+}
+func (c *stubStreamingCard) snapshot() (updates []string, final string, fail string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.updates...), c.final, c.fail
+}
+
+func TestProcessInteractiveEvents_StreamingCardShowsAnswerOnly(t *testing.T) {
+	p := &stubStreamingCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{Mode: "full", ThinkingMessages: true, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: true})
+
+	sessionKey := "dingtalk:user-stream"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-stream")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-stream",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventThinking, Content: "planning private steps"}
+	agentSession.events <- Event{Type: EventText, Content: "hello "}
+	agentSession.events <- Event{Type: EventToolUse, ToolName: "Bash", ToolInput: "pwd"}
+	agentSession.events <- Event{Type: EventToolResult, ToolName: "Bash", ToolResult: "/tmp"}
+	agentSession.events <- Event{Type: EventText, Content: "world"}
+	agentSession.events <- Event{Type: EventResult, Content: "hello world", Done: true}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-stream", time.Now(), nil, nil, state.replyCtx)
+
+	if p.card == nil {
+		t.Fatal("streaming card was not created")
+	}
+	updates, final, fail := p.card.snapshot()
+	if fail != "" {
+		t.Fatalf("streaming card fail = %q, want empty", fail)
+	}
+	if final != "hello world" {
+		t.Fatalf("final card content = %q, want answer only", final)
+	}
+	joined := strings.Join(append(updates, final), "\n")
+	for _, hidden := range []string{"planning private steps", "Bash", "pwd", "/tmp"} {
+		if strings.Contains(joined, hidden) {
+			t.Fatalf("streaming card exposed hidden progress %q in %q", hidden, joined)
+		}
+	}
+	if len(p.getSent()) != 0 {
+		t.Fatalf("plain sends = %#v, want none while streaming card succeeds", p.getSent())
+	}
+}
+
+func TestProcessInteractiveEvents_StreamingCardFailsOnAgentError(t *testing.T) {
+	p := &stubStreamingCardPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	sessionKey := "dingtalk:user-stream-error"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s-stream-error")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-stream-error",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "partial"}
+	agentSession.events <- Event{Type: EventError, Error: errors.New("boom")}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m-stream-error", time.Now(), nil, nil, state.replyCtx)
+
+	if p.card == nil {
+		t.Fatal("streaming card was not created")
+	}
+	_, _, fail := p.card.snapshot()
+	if !strings.Contains(fail, "boom") {
+		t.Fatalf("streaming card failure content = %q, want error text", fail)
+	}
+	if len(p.getSent()) != 0 {
+		t.Fatalf("plain sends = %#v, want no duplicate error when card fail succeeds", p.getSent())
+	}
+}
 
 func TestHandleMessage_InstantReply_SendsConfirmationWhenEnabled(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
