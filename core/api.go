@@ -27,6 +27,7 @@ type APIServer struct {
 	engines    map[string]*Engine // project name → engine
 	cron       *CronScheduler
 	relay      *RelayManager
+	notify     *notifySummaryDispatcher
 	mu         sync.RWMutex
 }
 
@@ -77,6 +78,7 @@ func NewAPIServer(dataDir string) (*APIServer, error) {
 	s.mux.HandleFunc("/relay/bind", s.handleRelayBind)
 	s.mux.HandleFunc("/relay/binding", s.handleRelayBinding)
 	s.mux.HandleFunc("/notify", s.handleNotify)
+	s.mux.HandleFunc("/notify-session", s.handleNotifySession)
 
 	return s, nil
 }
@@ -106,6 +108,10 @@ func (s *APIServer) SetCronScheduler(cs *CronScheduler) {
 	s.cron = cs
 }
 
+func (s *APIServer) SetNotifySessionSummaryConfig(cfg NotifySessionSummaryConfig) {
+	s.notify = newNotifySummaryDispatcher(s, cfg)
+}
+
 func (s *APIServer) Start() {
 	s.server = &http.Server{Handler: s.mux}
 	go func() {
@@ -117,6 +123,9 @@ func (s *APIServer) Start() {
 }
 
 func (s *APIServer) Stop() {
+	if s.notify != nil {
+		s.notify.stop()
+	}
 	if s.server != nil {
 		if err := s.server.Close(); err != nil && err != http.ErrServerClosed {
 			slog.Debug("api server close failed", "error", err)
@@ -607,43 +616,6 @@ func (s *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 		req.Platform = "dingtalk"
 	}
 
-	s.mu.RLock()
-	var engine *Engine
-	if len(s.engines) == 1 {
-		for _, e := range s.engines {
-			engine = e
-		}
-	} else {
-		for _, e := range s.engines {
-			engine = e
-			break
-		}
-	}
-	s.mu.RUnlock()
-
-	if engine == nil {
-		http.Error(w, "no engine available", http.StatusServiceUnavailable)
-		return
-	}
-
-	var targetPlatform Platform
-	for _, p := range engine.platforms {
-		if p.Name() == req.Platform {
-			targetPlatform = p
-			break
-		}
-	}
-	if targetPlatform == nil {
-		http.Error(w, fmt.Sprintf("platform %q not found", req.Platform), http.StatusNotFound)
-		return
-	}
-
-	notifier, ok := targetPlatform.(DirectNotifier)
-	if !ok {
-		http.Error(w, fmt.Sprintf("platform %q does not support direct notifications", req.Platform), http.StatusBadRequest)
-		return
-	}
-
 	// Best-effort Aone sync fires before DingTalk delivery — it runs in a
 	// goroutine so it never blocks, and must not depend on DingTalk success
 	// (which can fail due to IP whitelist, token expiry, etc.).
@@ -652,9 +624,9 @@ func (s *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
-	if err := notifier.SendNotification(ctx, req.UserID, req.Title, req.Content, req.Metadata); err != nil {
+	if err := s.sendDirectNotification(ctx, req); err != nil {
 		slog.Warn("notify: send failed", "platform", req.Platform, "user_id", req.UserID, "error", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeNotifyError(w, err)
 		return
 	}
 

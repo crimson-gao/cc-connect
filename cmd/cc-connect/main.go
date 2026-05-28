@@ -1030,6 +1030,15 @@ func main() {
 	if err != nil {
 		slog.Warn("api server unavailable", "error", err)
 	} else {
+		notifyEnabled, notifyTemplate, notifyLength, notifyIdleSecs, notifyMaxSecs := config.EffectiveNotifySessionConfig(cfg.NotifySession)
+		apiSrv.SetNotifySessionSummaryConfig(core.NotifySessionSummaryConfig{
+			Enabled:       notifyEnabled,
+			Template:      notifyTemplate,
+			SummaryLength: notifyLength,
+			IdleWait:      time.Duration(notifyIdleSecs) * time.Second,
+			MaxWait:       time.Duration(notifyMaxSecs) * time.Second,
+		})
+
 		relayMgr := core.NewRelayManager(cfg.DataDir)
 		if cfg.Relay.TimeoutSecs != nil {
 			secs := *cfg.Relay.TimeoutSecs

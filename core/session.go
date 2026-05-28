@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -374,6 +375,43 @@ func (sm *SessionManager) ActiveSessionID(userKey string) string {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.activeSession[userKey]
+}
+
+// FindActiveDirectSessionByUserID returns the sessionKey of the most recently
+// updated active 1:1 session for a user on a platform. sessionKey is matched
+// against the pattern "<platform>:d:*:<userID>" — group chats (":g:") and
+// shared-channel keys without the trailing userID segment are excluded.
+// Returns "" if no active 1:1 session exists. Read-only: does not create or
+// modify any session.
+func (sm *SessionManager) FindActiveDirectSessionByUserID(platform, userID string) string {
+	if platform == "" || userID == "" {
+		return ""
+	}
+	prefix := platform + ":d:"
+	suffix := ":" + userID
+
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	var bestKey string
+	var bestUpdated time.Time
+	for userKey, sid := range sm.activeSession {
+		if !strings.HasPrefix(userKey, prefix) || !strings.HasSuffix(userKey, suffix) {
+			continue
+		}
+		s, ok := sm.sessions[sid]
+		if !ok {
+			continue
+		}
+		s.mu.Lock()
+		updated := s.UpdatedAt
+		s.mu.Unlock()
+		if bestKey == "" || updated.After(bestUpdated) {
+			bestKey = userKey
+			bestUpdated = updated
+		}
+	}
+	return bestKey
 }
 
 // SetSessionName sets a custom display name for an agent session.

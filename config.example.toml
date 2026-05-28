@@ -312,6 +312,46 @@ level = "info" # debug, info, warn, error
 #   #   -d "{\"session_key\":\"telegram:123:123\",\"event\":\"git:commit\",\"prompt\":\"New commit: $MSG. Review it briefly.\"}"
 
 # =============================================================================
+# Notify Session Summary / 通知会话总结
+# =============================================================================
+# Controls POST /notify-session. When enabled, Alibaba staff notifications with
+# an active 1:1 session are batched and injected as a generated user prompt.
+# Otherwise /notify-session falls back to the same direct notification path as
+# /notify.
+# 控制 POST /notify-session。开启后，阿里员工通知会先按活跃 1:1 会话节流聚合，
+# 再以用户 prompt 注入会话；未命中时回退到 /notify 的直推路径。
+#
+# Available template variables (Go text/template syntax, camelCase only):
+#   {{.staffId}} {{.userId}} {{.platform}} {{.sessionKey}}
+#   {{.summaryLength}} {{.notificationCount}} {{.notifications}}
+#   {{.combinedContent}}
+#   {{.workspaceId}} {{.issueId}} {{.issueTitle}} {{.issueStatus}}
+#   {{.issueCreateTime}} {{.inboxType}}
+#
+# If `template` is omitted, the default in core/notify_summary.go
+# (defaultNotifySessionSummaryTemplate) is used. Only set `template` when you
+# want to override it — keep this example in sync with the Go constant.
+#
+# [notify_session_summary]
+# enabled = false
+# summary_length = 300
+# idle_wait_secs = 10
+# max_wait_secs = 30
+# template = """
+# 收到了如下 Multica Issue 通知消息。请使用 multica cli 查询该 Issue 的当前实时状态和工作进度，生成一段长度约 {{.summaryLength}} 字的进度总结。直接输出总结报告，不要包含其他信息。
+#
+# Staff ID: {{.staffId}}
+# Workspace ID: {{.workspaceId}}
+# Issue ID: {{.issueId}}
+# Issue Title: {{.issueTitle}}
+# Issue Status: {{.issueStatus}}
+# Issue Created At: {{.issueCreateTime}}
+#
+# 通知上下文:
+# {{.combinedContent}}
+# """
+
+# =============================================================================
 # Bridge Platform (External Adapters via WebSocket)
 # Bridge 平台（通过 WebSocket 接入外部适配器）
 # =============================================================================

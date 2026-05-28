@@ -1181,6 +1181,111 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 	return nil
 }
 
+// ExternalInjectionContext bundles everything a caller needs to construct a
+// Message and drive an agent turn against an existing session. Produced by
+// Engine.PrepareExternalInjection.
+type ExternalInjectionContext struct {
+	Platform       Platform
+	PlatformName   string
+	ReplyCtx       any
+	Agent          Agent
+	Sessions       *SessionManager
+	InteractiveKey string
+	WorkspaceDir   string
+}
+
+// PrepareExternalInjection resolves the platform, reply context, agent,
+// session manager, interactive key and workspace dir for a sessionKey so the
+// caller can drive an external-origin agent turn (webhook, notify-session, etc).
+// It does NOT TryLock the session — the caller decides what to do on busy.
+func (e *Engine) PrepareExternalInjection(sessionKey string) (*ExternalInjectionContext, error) {
+	if sessionKey == "" {
+		return nil, fmt.Errorf("session key required")
+	}
+
+	platformName := ""
+	if idx := strings.Index(sessionKey, ":"); idx > 0 {
+		platformName = sessionKey[:idx]
+	}
+
+	var targetPlatform Platform
+	for _, p := range e.platforms {
+		if p.Name() == platformName {
+			targetPlatform = p
+			break
+		}
+	}
+	if targetPlatform == nil {
+		return nil, fmt.Errorf("platform %q not found for session %q", platformName, sessionKey)
+	}
+
+	rc, ok := targetPlatform.(ReplyContextReconstructor)
+	if !ok {
+		return nil, fmt.Errorf("platform %q does not support proactive messaging", platformName)
+	}
+	replyCtx, err := rc.ReconstructReplyCtx(sessionKey)
+	if err != nil {
+		return nil, fmt.Errorf("reconstruct reply context: %w", err)
+	}
+
+	agent, sessions := e.sessionContextForKey(sessionKey)
+	interactiveKey := e.interactiveKeyForSessionKey(sessionKey)
+	workspaceDir := ""
+	if interactiveKey != sessionKey {
+		if suffix := ":" + sessionKey; strings.HasSuffix(interactiveKey, suffix) {
+			workspaceDir = strings.TrimSuffix(interactiveKey, suffix)
+		}
+	}
+
+	return &ExternalInjectionContext{
+		Platform:       targetPlatform,
+		PlatformName:   platformName,
+		ReplyCtx:       replyCtx,
+		Agent:          agent,
+		Sessions:       sessions,
+		InteractiveKey: interactiveKey,
+		WorkspaceDir:   workspaceDir,
+	}, nil
+}
+
+// InjectExternalPrompt injects a prompt into an existing session as if the
+// identified user typed it, then drives a normal agent turn whose reply is sent
+// back to the platform. The caller is responsible for confirming the session
+// exists. This function does not create user-visible sessions.
+//
+// Runs synchronously for the full duration of the agent turn; the underlying
+// turn loop is bounded by the engine context (e.ctx), not a per-call ctx.
+func (e *Engine) InjectExternalPrompt(sessionKey, userID, prompt string) error {
+	if strings.TrimSpace(prompt) == "" {
+		return fmt.Errorf("prompt required")
+	}
+	if strings.TrimSpace(userID) == "" {
+		return fmt.Errorf("user id required")
+	}
+
+	inj, err := e.PrepareExternalInjection(sessionKey)
+	if err != nil {
+		return err
+	}
+
+	msg := &Message{
+		SessionKey: sessionKey,
+		Platform:   inj.PlatformName,
+		UserID:     userID,
+		UserName:   userID,
+		Content:    prompt,
+		ReplyCtx:   inj.ReplyCtx,
+	}
+
+	session := inj.Sessions.GetOrCreateActive(sessionKey)
+	if !session.TryLock() {
+		return fmt.Errorf("session %q is busy", sessionKey)
+	}
+
+	e.processInteractiveMessageWith(inj.Platform, msg, session, inj.Agent, inj.Sessions, inj.InteractiveKey, inj.WorkspaceDir, sessionKey)
+	return nil
+}
+
 func cronRunTitle(job *CronJob) string {
 	if job == nil {
 		return "cron"

@@ -200,58 +200,35 @@ func (ws *WebhookServer) resolveEngine(project string) (*Engine, error) {
 }
 
 func (ws *WebhookServer) executePrompt(engine *Engine, sessionKey, prompt string, silent bool, event string) {
-	platformName := ""
-	if idx := strings.Index(sessionKey, ":"); idx > 0 {
-		platformName = sessionKey[:idx]
-	}
-
-	var targetPlatform Platform
-	for _, p := range engine.platforms {
-		if p.Name() == platformName {
-			targetPlatform = p
-			break
-		}
-	}
-	if targetPlatform == nil {
-		slog.Error("webhook: platform not found", "event", event, "platform", platformName)
-		return
-	}
-
-	rc, ok := targetPlatform.(ReplyContextReconstructor)
-	if !ok {
-		slog.Error("webhook: platform does not support proactive messaging", "event", event, "platform", platformName)
-		return
-	}
-
-	replyCtx, err := rc.ReconstructReplyCtx(sessionKey)
+	inj, err := engine.PrepareExternalInjection(sessionKey)
 	if err != nil {
-		slog.Error("webhook: reconstruct reply context failed", "event", event, "error", err)
+		slog.Error("webhook: prepare injection failed", "event", event, "session_key", sessionKey, "error", err)
 		return
 	}
 
 	if !silent {
-		engine.send(targetPlatform, replyCtx, fmt.Sprintf("🪝 %s", event))
+		engine.send(inj.Platform, inj.ReplyCtx, fmt.Sprintf("🪝 %s", event))
 	}
 
 	msg := &Message{
 		SessionKey: sessionKey,
-		Platform:   platformName,
+		Platform:   inj.PlatformName,
 		UserID:     "webhook",
 		UserName:   "webhook",
 		Content:    prompt,
-		ReplyCtx:   replyCtx,
+		ReplyCtx:   inj.ReplyCtx,
 	}
 
-	session := engine.sessions.GetOrCreateActive(sessionKey)
+	session := inj.Sessions.GetOrCreateActive(sessionKey)
 	if !session.TryLock() {
 		slog.Warn("webhook: session busy, queued prompt dropped", "event", event, "session_key", sessionKey)
 		if !silent {
-			engine.send(targetPlatform, replyCtx, fmt.Sprintf("🪝 ⚠️ session busy, skipped: %s", event))
+			engine.send(inj.Platform, inj.ReplyCtx, fmt.Sprintf("🪝 ⚠️ session busy, skipped: %s", event))
 		}
 		return
 	}
 
-	engine.processInteractiveMessage(targetPlatform, msg, session)
+	engine.processInteractiveMessageWith(inj.Platform, msg, session, inj.Agent, inj.Sessions, inj.InteractiveKey, inj.WorkspaceDir, sessionKey)
 	slog.Info("webhook: prompt executed", "event", event, "session_key", sessionKey)
 }
 
