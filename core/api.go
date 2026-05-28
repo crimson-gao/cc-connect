@@ -27,7 +27,6 @@ type APIServer struct {
 	engines    map[string]*Engine // project name → engine
 	cron       *CronScheduler
 	relay      *RelayManager
-	notify     *notifySummaryDispatcher
 	mu         sync.RWMutex
 }
 
@@ -108,10 +107,6 @@ func (s *APIServer) SetCronScheduler(cs *CronScheduler) {
 	s.cron = cs
 }
 
-func (s *APIServer) SetNotifySessionSummaryConfig(cfg NotifySessionSummaryConfig) {
-	s.notify = newNotifySummaryDispatcher(s, cfg)
-}
-
 func (s *APIServer) Start() {
 	s.server = &http.Server{Handler: s.mux}
 	go func() {
@@ -123,9 +118,6 @@ func (s *APIServer) Start() {
 }
 
 func (s *APIServer) Stop() {
-	if s.notify != nil {
-		s.notify.stop()
-	}
 	if s.server != nil {
 		if err := s.server.Close(); err != nil && err != http.ErrServerClosed {
 			slog.Debug("api server close failed", "error", err)
@@ -515,13 +507,18 @@ func (s *APIServer) handleRelayBinding(w http.ResponseWriter, r *http.Request) {
 
 // ── Notify API ────────────────────────────────────────────────
 
-// NotifyRequest is the JSON body for POST /notify.
+// NotifyRequest is the JSON body for POST /notify. NotifyUser is a pointer
+// so absence on the wire reads as default-true (preserves the pre-redesign
+// contract for callers that don't know about it yet). Set explicit `false`
+// to skip the platform send while keeping the Aone-comment mirror — used by
+// multica when it routes through the per-(staff,issue) summary path.
 type NotifyRequest struct {
-	Platform string            `json:"platform"`
-	UserID   string            `json:"user_id"`
-	Title    string            `json:"title"`
-	Content  string            `json:"content"`
-	Metadata map[string]string `json:"metadata,omitempty"`
+	Platform   string            `json:"platform"`
+	UserID     string            `json:"user_id"`
+	Title      string            `json:"title"`
+	Content    string            `json:"content"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	NotifyUser *bool             `json:"notify_user,omitempty"`
 }
 
 // aoneIDRegex extracts an Aone work item ID from strings like "[AONE-32274756]".
@@ -616,10 +613,19 @@ func (s *APIServer) handleNotify(w http.ResponseWriter, r *http.Request) {
 		req.Platform = "dingtalk"
 	}
 
-	// Best-effort Aone sync fires before DingTalk delivery — it runs in a
-	// goroutine so it never blocks, and must not depend on DingTalk success
-	// (which can fail due to IP whitelist, token expiry, etc.).
+	// Best-effort Aone sync always runs — it's the only reliable mirror to
+	// the Aone work item regardless of platform delivery. Runs in a goroutine
+	// inside pushAoneComment so it never blocks.
 	pushAoneComment(req.Title, req.Content, req.Metadata["inbox_type"])
+
+	// notify_user gates the platform delivery only. When explicitly false,
+	// the caller (typically multica's summary dispatcher) only wants the
+	// Aone mirror — the user-facing notification will be delivered later via
+	// /notify-session after the summary bucket flushes.
+	if req.NotifyUser != nil && !*req.NotifyUser {
+		apiJSON(w, http.StatusOK, map[string]string{"status": "ok", "delivered": "aone_only"})
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()

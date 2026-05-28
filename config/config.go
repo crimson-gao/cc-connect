@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"text/template"
 
 	"github.com/BurntSushi/toml"
 )
@@ -108,7 +107,6 @@ type Config struct {
 	Cron               CronConfig              `toml:"cron"`
 	Queue              QueueConfig             `toml:"queue"`
 	Webhook            WebhookConfig           `toml:"webhook"`
-	NotifySession      NotifySessionConfig     `toml:"notify_session_summary"`
 	Bridge             BridgeConfig            `toml:"bridge"`
 	Management         ManagementConfig        `toml:"management"`
 	Hooks              []HookConfig            `toml:"hooks"`
@@ -138,15 +136,6 @@ type WebhookConfig struct {
 	Port    int    `toml:"port,omitempty"`  // listen port; default 9111
 	Token   string `toml:"token,omitempty"` // shared secret for authentication; empty = no auth
 	Path    string `toml:"path,omitempty"`  // URL path prefix; default "/hook"
-}
-
-// NotifySessionConfig controls /notify-session summary injection.
-type NotifySessionConfig struct {
-	Enabled       *bool  `toml:"enabled"`                  // default false
-	Template      string `toml:"template,omitempty"`       // Go text/template prompt
-	SummaryLength int    `toml:"summary_length,omitempty"` // default 300
-	IdleWaitSecs  int    `toml:"idle_wait_secs,omitempty"` // default 10
-	MaxWaitSecs   int    `toml:"max_wait_secs,omitempty"`  // default 30
 }
 
 // BridgeConfig controls the WebSocket bridge for external platform adapters.
@@ -749,9 +738,6 @@ func (c *Config) validate() error {
 	if err := validateDisplayConfig("display", &c.Display); err != nil {
 		return err
 	}
-	if err := validateNotifySessionConfig(&c.NotifySession); err != nil {
-		return err
-	}
 	switch strings.ToLower(strings.TrimSpace(c.AttachmentSend)) {
 	case "", "on", "off":
 	default:
@@ -804,53 +790,6 @@ func (c *Config) validate() error {
 		}
 		if err := validateDisplayConfig(prefix+".display", proj.Display); err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-func NotifySessionEnabled(c NotifySessionConfig) bool {
-	return c.Enabled != nil && *c.Enabled
-}
-
-func EffectiveNotifySessionConfig(c NotifySessionConfig) (enabled bool, promptTemplate string, summaryLength, idleWaitSecs, maxWaitSecs int) {
-	enabled = NotifySessionEnabled(c)
-	promptTemplate = c.Template
-	summaryLength = c.SummaryLength
-	if summaryLength <= 0 {
-		summaryLength = 300
-	}
-	idleWaitSecs = c.IdleWaitSecs
-	if idleWaitSecs <= 0 {
-		idleWaitSecs = 10
-	}
-	maxWaitSecs = c.MaxWaitSecs
-	if maxWaitSecs <= 0 {
-		maxWaitSecs = 30
-	}
-	return enabled, promptTemplate, summaryLength, idleWaitSecs, maxWaitSecs
-}
-
-func validateNotifySessionConfig(c *NotifySessionConfig) error {
-	if c == nil {
-		return nil
-	}
-	if c.SummaryLength < 0 {
-		return fmt.Errorf("config: notify_session_summary.summary_length must be >= 0")
-	}
-	if c.IdleWaitSecs < 0 {
-		return fmt.Errorf("config: notify_session_summary.idle_wait_secs must be >= 0")
-	}
-	if c.MaxWaitSecs < 0 {
-		return fmt.Errorf("config: notify_session_summary.max_wait_secs must be >= 0")
-	}
-	_, _, _, idleWaitSecs, maxWaitSecs := EffectiveNotifySessionConfig(*c)
-	if maxWaitSecs < idleWaitSecs {
-		return fmt.Errorf("config: notify_session_summary.max_wait_secs must be >= idle_wait_secs")
-	}
-	if strings.TrimSpace(c.Template) != "" {
-		if _, err := template.New("notify_session_summary").Parse(c.Template); err != nil {
-			return fmt.Errorf("config: notify_session_summary.template: %w", err)
 		}
 	}
 	return nil

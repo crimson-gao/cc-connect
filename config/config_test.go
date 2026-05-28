@@ -207,34 +207,6 @@ func TestRunAsEnv_RejectsDangerousVars(t *testing.T) {
 	}
 }
 
-func TestNotifySessionConfigValidationAndDefaults(t *testing.T) {
-	cfg := Config{
-		Projects: []ProjectConfig{validProject("demo")},
-		NotifySession: NotifySessionConfig{
-			Template: "{{.staffId}} {{.issueId}}",
-		},
-	}
-	if err := cfg.validate(); err != nil {
-		t.Fatalf("validate() unexpected error: %v", err)
-	}
-	enabled, tmpl, summaryLength, idleWaitSecs, maxWaitSecs := EffectiveNotifySessionConfig(cfg.NotifySession)
-	if enabled {
-		t.Fatal("notify session summary should be disabled by default")
-	}
-	if tmpl != "{{.staffId}} {{.issueId}}" || summaryLength != 300 || idleWaitSecs != 10 || maxWaitSecs != 30 {
-		t.Fatalf("effective config = enabled:%v template:%q len:%d idle:%d max:%d", enabled, tmpl, summaryLength, idleWaitSecs, maxWaitSecs)
-	}
-
-	badTemplate := cfg
-	badTemplate.NotifySession.Template = "{{"
-	assertErrContains(t, badTemplate.validate(), "notify_session_summary.template")
-
-	badWait := cfg
-	badWait.NotifySession.IdleWaitSecs = 30
-	badWait.NotifySession.MaxWaitSecs = 10
-	assertErrContains(t, badWait.validate(), "max_wait_secs must be >= idle_wait_secs")
-}
-
 func TestEffectiveDisplayQuiet(t *testing.T) {
 	tru, fal := true, false
 	compact := DisplayModeCompact

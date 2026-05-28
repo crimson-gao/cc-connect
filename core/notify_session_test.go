@@ -4,14 +4,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// cloneStringMap is the local clone helper used by notifyTestPlatform.
+// Same shape as the helper previously living in notify_summary.go.
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
 
 type notifyTestPlatform struct {
 	stubPlatformEngine
@@ -49,15 +60,6 @@ func (p *notifyTestPlatform) notificationCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.notifications)
-}
-
-func (p *notifyTestPlatform) lastNotification() NotifyRequest {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.notifications) == 0 {
-		return NotifyRequest{}
-	}
-	return p.notifications[len(p.notifications)-1]
 }
 
 type notifyRecordingAgent struct {
@@ -132,57 +134,28 @@ func newNotifyTestAPI(platform *notifyTestPlatform, agentSession *notifyRecordin
 	return &APIServer{engines: map[string]*Engine{"test": engine}}, engine
 }
 
-func postNotifySession(t *testing.T, api *APIServer, reqBody NotifyRequest) *httptest.ResponseRecorder {
+func postNotifySession(t *testing.T, api *APIServer, body NotifySessionRequest) *httptest.ResponseRecorder {
 	t.Helper()
-	body, err := json.Marshal(reqBody)
+	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/notify-session", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/notify-session", bytes.NewReader(raw))
 	rec := httptest.NewRecorder()
 	api.handleNotifySession(rec, req)
 	return rec
 }
 
-func TestStripStatusPrefix(t *testing.T) {
-	tests := map[string]string{
-		"":                  "",
-		"  ":                "",
-		"status:code-review": "code-review",
-		"Status:Code-Review": "Code-Review",
-		"STATUS:Blocked":    "Blocked",
-		"area:backend":      "area:backend", // no status prefix -> unchanged
-		"status:":           "",             // empty after prefix
-		"statusoid:foo":     "statusoid:foo",
+func postNotify(t *testing.T, api *APIServer, body NotifyRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
 	}
-	for in, want := range tests {
-		if got := stripStatusPrefix(in); got != want {
-			t.Errorf("stripStatusPrefix(%q) = %q; want %q", in, got, want)
-		}
-	}
-}
-
-func TestHumanizeIssueElapsed(t *testing.T) {
-	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{"", ""},
-		{"not-a-date", ""},
-		{"2026-05-28T11:59:30Z", "刚刚"},                // 30s
-		{"2026-05-28T11:45:00Z", "15 分钟"},             // 15min
-		{"2026-05-28T08:30:00Z", "3 小时 30 分钟"},        // 3h30m
-		{"2026-05-28T11:00:00Z", "1 小时"},              // exactly 1h
-		{"2026-05-26T11:00:00Z", "2 天 1 小时"},          // 2d1h
-		{"2026-05-26T12:00:00Z", "2 天"},               // exactly 2d
-		{"2026-05-28T12:00:30Z", "刚刚"},                // future -> 刚刚
-	}
-	for _, tt := range tests {
-		if got := humanizeIssueElapsed(tt.in, now); got != tt.want {
-			t.Errorf("humanizeIssueElapsed(%q) = %q; want %q", tt.in, got, tt.want)
-		}
-	}
+	req := httptest.NewRequest(http.MethodPost, "/notify", bytes.NewReader(raw))
+	rec := httptest.NewRecorder()
+	api.handleNotify(rec, req)
+	return rec
 }
 
 func TestStaffIDFromAlibabaUserID(t *testing.T) {
@@ -232,146 +205,81 @@ func TestFindActiveDirectSessionByUserID(t *testing.T) {
 	}
 }
 
-func TestHandleNotifySession_DisabledFallsBackToDirectNotify(t *testing.T) {
-	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}, reconstruct: true}
-	api, _ := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
-	api.SetNotifySessionSummaryConfig(NotifySessionSummaryConfig{Enabled: false})
-
-	rec := postNotifySession(t, api, NotifyRequest{
-		Platform: "dingtalk",
-		UserID:   "1001",
-		Title:    "Issue updated",
-		Content:  "body",
-		Metadata: map[string]string{"issue_id": "issue-1"},
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-	}
-	if platform.notificationCount() != 1 {
-		t.Fatalf("notifications = %d, want 1", platform.notificationCount())
-	}
-	got := platform.lastNotification()
-	if got.UserID != "1001" || got.Title != "Issue updated" || got.Content != "body" || got.Metadata["issue_id"] != "issue-1" {
-		t.Fatalf("notification = %#v", got)
-	}
-}
-
-func TestHandleNotifySession_EnabledNoSessionFallsBackToDirectNotify(t *testing.T) {
-	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}, reconstruct: true}
-	api, _ := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
-	api.SetNotifySessionSummaryConfig(NotifySessionSummaryConfig{Enabled: true, IdleWait: 10 * time.Millisecond, MaxWait: 50 * time.Millisecond})
-
-	rec := postNotifySession(t, api, NotifyRequest{
-		Platform: "dingtalk",
-		UserID:   "1001@alibaba-inc.com",
-		Title:    "Issue updated",
-		Content:  "body",
-	})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
-	}
-	if platform.notificationCount() != 1 {
-		t.Fatalf("notifications = %d, want 1", platform.notificationCount())
-	}
-	if got := platform.lastNotification().UserID; got != "1001" {
-		t.Fatalf("fallback userID = %q, want stripped staff id", got)
-	}
-}
-
-func TestHandleNotifySession_QueuesAndInjectsCombinedPrompt(t *testing.T) {
+func TestHandleNotifySession_InjectsPromptVerbatim(t *testing.T) {
 	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}, reconstruct: true}
 	agentSession := newNotifyRecordingAgentSession()
 	api, engine := newNotifyTestAPI(platform, agentSession)
-	sessionKey := "dingtalk:d:conv1:1001"
-	engine.sessions.GetOrCreateActive(sessionKey)
-	api.SetNotifySessionSummaryConfig(NotifySessionSummaryConfig{
-		Enabled:       true,
-		Template:      `staff={{.staffId}} issue={{.issueId}} status={{.issueStatus}} count={{.notificationCount}} len={{.summaryLength}} {{.combinedContent}}`,
-		SummaryLength: 120,
-		IdleWait:      20 * time.Millisecond,
-		MaxWait:       200 * time.Millisecond,
-	})
-
-	first := postNotifySession(t, api, NotifyRequest{
-		Platform: "dingtalk",
-		UserID:   "1001@alibaba-inc.com",
-		Title:    "First",
-		Content:  "first body",
-		Metadata: map[string]string{
-			"workspace_id": "ws-1",
-			"issue_id":     "issue-1",
-			"issue_status": "todo",
-		},
-	})
-	if first.Code != http.StatusOK {
-		t.Fatalf("first status = %d, body=%s", first.Code, first.Body.String())
-	}
-	second := postNotifySession(t, api, NotifyRequest{
-		Platform: "dingtalk",
-		UserID:   "1001@alibaba-inc.com",
-		Title:    "Second",
-		Content:  "second body",
-		Metadata: map[string]string{
-			"issue_id":     "issue-1",
-			"issue_status": "in_progress",
-		},
-	})
-	if second.Code != http.StatusOK {
-		t.Fatalf("second status = %d, body=%s", second.Code, second.Body.String())
-	}
-
-	waitFor(t, time.Second, func() bool { return agentSession.promptCount() == 1 })
-	if platform.notificationCount() != 0 {
-		t.Fatalf("direct notifications = %d, want 0", platform.notificationCount())
-	}
-	prompt := agentSession.lastPrompt()
-	for _, want := range []string{"staff=1001", "issue=issue-1", "status=in_progress", "count=2", "len=120", "First", "first body", "Second", "second body"} {
-		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q:\n%s", want, prompt)
-		}
-	}
-}
-
-func TestHandleNotifySession_InjectFailureFallsBackToOriginalNotifications(t *testing.T) {
-	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
-	api, engine := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
 	engine.sessions.GetOrCreateActive("dingtalk:d:conv1:1001")
-	api.SetNotifySessionSummaryConfig(NotifySessionSummaryConfig{
-		Enabled:  true,
-		IdleWait: 10 * time.Millisecond,
-		MaxWait:  50 * time.Millisecond,
-	})
 
-	rec := postNotifySession(t, api, NotifyRequest{
+	prompt := "已收到 3 条通知，请总结一下。"
+	rec := postNotifySession(t, api, NotifySessionRequest{
 		Platform: "dingtalk",
 		UserID:   "1001@alibaba-inc.com",
-		Title:    "Issue updated",
-		Content:  "body",
-		Metadata: map[string]string{"issue_id": "issue-1"},
+		Prompt:   prompt,
 	})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
 	}
-	waitFor(t, time.Second, func() bool { return platform.notificationCount() == 1 })
-	got := platform.lastNotification()
-	if got.UserID != "1001" || got.Title != "Issue updated" || got.Content != "body" || got.Metadata["issue_id"] != "issue-1" {
-		t.Fatalf("fallback notification = %#v", got)
+	waitFor(t, time.Second, func() bool { return agentSession.promptCount() == 1 })
+	if got := agentSession.lastPrompt(); got != prompt {
+		t.Fatalf("prompt = %q; want verbatim %q", got, prompt)
+	}
+	if platform.notificationCount() != 0 {
+		t.Fatalf("direct notifications = %d; should be 0 (notify-session is inject-only)", platform.notificationCount())
 	}
 }
 
-func TestHandleNotifySession_DirectSendErrorPropagates(t *testing.T) {
-	platform := &notifyTestPlatform{
-		stubPlatformEngine: stubPlatformEngine{n: "dingtalk"},
-		notificationErr:    errors.New("token expired"),
-	}
+func TestHandleNotifySession_RejectsBareStaffID(t *testing.T) {
+	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}, reconstruct: true}
 	api, _ := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
+	rec := postNotifySession(t, api, NotifySessionRequest{UserID: "1001", Prompt: "x"})
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
 
-	rec := postNotifySession(t, api, NotifyRequest{
-		Platform: "dingtalk",
-		UserID:   "not-alibaba@example.com",
-		Content:  "body",
+func TestHandleNotifySession_404WhenNoSession(t *testing.T) {
+	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}, reconstruct: true}
+	api, _ := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
+	rec := postNotifySession(t, api, NotifySessionRequest{UserID: "9999@alibaba-inc.com", Prompt: "x"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestHandleNotify_RespectsNotifyUserFalse(t *testing.T) {
+	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	api, _ := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
+	notifyFalse := false
+	rec := postNotify(t, api, NotifyRequest{
+		Platform:   "dingtalk",
+		UserID:     "1001",
+		Title:      "x",
+		Content:    "y",
+		NotifyUser: &notifyFalse,
 	})
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want 500", rec.Code)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if platform.notificationCount() != 0 {
+		t.Fatalf("notifications = %d; want 0 when notify_user=false", platform.notificationCount())
+	}
+}
+
+func TestHandleNotify_DefaultsToNotifyUserTrue(t *testing.T) {
+	platform := &notifyTestPlatform{stubPlatformEngine: stubPlatformEngine{n: "dingtalk"}}
+	api, _ := newNotifyTestAPI(platform, newNotifyRecordingAgentSession())
+	rec := postNotify(t, api, NotifyRequest{
+		Platform: "dingtalk",
+		UserID:   "1001",
+		Title:    "x",
+		Content:  "y",
+		// NotifyUser omitted → default true
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	if platform.notificationCount() != 1 {
+		t.Fatalf("notifications = %d; want 1 when notify_user is absent", platform.notificationCount())
 	}
 }
