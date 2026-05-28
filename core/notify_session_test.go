@@ -144,6 +144,47 @@ func postNotifySession(t *testing.T, api *APIServer, reqBody NotifyRequest) *htt
 	return rec
 }
 
+func TestStripStatusPrefix(t *testing.T) {
+	tests := map[string]string{
+		"":                  "",
+		"  ":                "",
+		"status:code-review": "code-review",
+		"Status:Code-Review": "Code-Review",
+		"STATUS:Blocked":    "Blocked",
+		"area:backend":      "area:backend", // no status prefix -> unchanged
+		"status:":           "",             // empty after prefix
+		"statusoid:foo":     "statusoid:foo",
+	}
+	for in, want := range tests {
+		if got := stripStatusPrefix(in); got != want {
+			t.Errorf("stripStatusPrefix(%q) = %q; want %q", in, got, want)
+		}
+	}
+}
+
+func TestHumanizeIssueElapsed(t *testing.T) {
+	now := time.Date(2026, 5, 28, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"not-a-date", ""},
+		{"2026-05-28T11:59:30Z", "刚刚"},                // 30s
+		{"2026-05-28T11:45:00Z", "15 分钟"},             // 15min
+		{"2026-05-28T08:30:00Z", "3 小时 30 分钟"},        // 3h30m
+		{"2026-05-28T11:00:00Z", "1 小时"},              // exactly 1h
+		{"2026-05-26T11:00:00Z", "2 天 1 小时"},          // 2d1h
+		{"2026-05-26T12:00:00Z", "2 天"},               // exactly 2d
+		{"2026-05-28T12:00:30Z", "刚刚"},                // future -> 刚刚
+	}
+	for _, tt := range tests {
+		if got := humanizeIssueElapsed(tt.in, now); got != tt.want {
+			t.Errorf("humanizeIssueElapsed(%q) = %q; want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestStaffIDFromAlibabaUserID(t *testing.T) {
 	tests := []struct {
 		in   string

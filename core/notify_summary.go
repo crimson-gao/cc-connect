@@ -15,39 +15,44 @@ import (
 )
 
 // defaultNotifySessionSummaryTemplate uses English imperatives (more reliable
-// for instruction following) while requiring a Chinese summary as output.
+// for instruction following) while requiring a Chinese summary as output. The
+// agent is told to output a fixed markdown structure with one English heading
+// ("# Title") and the rest in Chinese; only the "简介" paragraph is freeform.
 //
-// The agent is allowed to call the Multica CLI for two specific reads
-// (issue metadata + comments) — both keyed by the issue_id already in the
-// prompt, so the agent does not need to discover anything. All other tool
-// calls (shell, grep, find, filesystem search) are explicitly forbidden to
-// avoid the 4+ minute "search for the UUID literally" wander that the
-// smoke tests reproduced when the instruction was open-ended.
-const defaultNotifySessionSummaryTemplate = `You have received {{.notificationCount}} Multica issue notification(s) for issue {{.issueId}}.
-
-Cached issue context (already known, do NOT re-fetch):
-- Title: "{{.issueTitle}}"
-- Status (DB): {{.issueStatus}}
-- Status tag (first "status:" label): {{.issueStatusTag}}
-- Linked pull/merge requests:
-{{.issuePullRequests}}
-
-Generate a concise progress summary of approximately {{.summaryLength}} Chinese characters.
-
-Allowed tool calls (each at most once, only if the cached context is insufficient):
-- ` + "`multica issue get {{.issueId}}`" + ` — fetch full issue metadata (assignee, labels, milestone, parents).
-- ` + "`multica issue comment list {{.issueId}}`" + ` — fetch the comment thread.
-
-Hard constraints (must follow ALL):
-- Write the summary in Chinese (中文). Do not output any English.
-- DO NOT call shell, grep, rg, find, ls, cat, sed, awk, git, curl, or ANY command other than the two ` + "`multica`" + ` reads above. DO NOT search the filesystem or read any file.
-- Merge related events by timeline, deduplicate, and highlight the most recent state transition. If a status tag is present, mention it.
-- If pull/merge requests are listed, surface them in the summary (state + a short label).
-- Output the summary text directly. No preamble, no greeting, no meta phrases (e.g. "以下是总结", "Summary:", "好的", "I will now…").
-- End with exactly one line: "详情：multica issue {{.issueId}}"
-
-Notification context:
-{{.combinedContent}}`
+// The agent may call the Multica CLI for two specific reads (issue metadata +
+// comments) — both keyed by the issue_id already in the prompt, so it never
+// has to discover anything. All other tool calls (shell, grep, find,
+// filesystem search) are forbidden to prevent the 4+ minute "grep for the
+// UUID literally" wander reproduced in early smoke runs.
+const defaultNotifySessionSummaryTemplate = "You have received {{.notificationCount}} Multica issue notification(s) for issue {{.issueId}}.\n\n" +
+	"Cached issue context (already known, do NOT re-fetch):\n" +
+	"- Identifier: {{.issueIdentifier}}\n" +
+	"- URL: {{.issueUrl}}\n" +
+	"- Title: \"{{.issueTitle}}\"\n" +
+	"- DB status: {{.issueStatus}}\n" +
+	"- Status tag (raw): {{.issueStatusTag}}\n" +
+	"- Status tag (no prefix): {{.issueStatusTagShort}}\n" +
+	"- Created at: {{.issueCreateTime}}\n" +
+	"- Elapsed since creation: {{.issueElapsed}}\n" +
+	"- Linked pull/merge requests:\n" +
+	"{{.issuePullRequests}}\n\n" +
+	"Allowed tool calls (each at most once, only if the cached context is insufficient):\n" +
+	"- `multica issue get {{.issueId}}` — fetch full issue metadata.\n" +
+	"- `multica issue comment list {{.issueId}}` — fetch the comment thread.\n\n" +
+	"Output EXACTLY this markdown structure, replacing [简介] with one paragraph of about {{.summaryLength}} Chinese characters describing the current progress and runtime status (derived from the notification context below; reference recent state transitions, comments, and linked PR/MR activity where relevant). Do NOT add anything before or after.\n\n" +
+	"# Title\n\n" +
+	"**[{{.issueIdentifier}} - {{.issueTitle}}]({{.issueUrl}})**\n\n" +
+	"- 状态：{{.issueStatus}}\n" +
+	"- 任务状态：{{.issueStatusTagShort}}\n\n" +
+	"[简介]\n\n" +
+	"> 已运行时间：{{.issueElapsed}}\n\n" +
+	"Hard constraints (must follow ALL):\n" +
+	"- The heading line is literally `# Title` (English). Everything else is Chinese.\n" +
+	"- Keep the linked title line, the two bullet lines (`状态` / `任务状态`), and the trailing `已运行时间` quote line exactly as templated. Only the [简介] paragraph is freeform.\n" +
+	"- DO NOT call shell, grep, rg, find, ls, cat, sed, awk, git, curl, or ANY command other than the two `multica` reads above. DO NOT search the filesystem or read any file.\n" +
+	"- No preamble, no greeting, no meta phrases (e.g. \"以下是总结\", \"Summary:\", \"好的\", \"I will now…\").\n\n" +
+	"Notification context:\n" +
+	"{{.combinedContent}}"
 
 type NotifySessionSummaryConfig struct {
 	Enabled       bool
@@ -464,25 +469,89 @@ func notifySummaryTemplateData(cfg NotifySessionSummaryConfig, bucket *notifySum
 	if issueTitle == "" && len(bucket.notifications) > 0 {
 		issueTitle = bucket.notifications[len(bucket.notifications)-1].Title
 	}
+
+	issueStatusTag := latestMetadataValue(bucket.notifications, "issue_status_tag", "issueStatusTag")
+	issueCreateTime := latestMetadataValue(bucket.notifications, "issue_create_time", "issueCreateTime")
+	issueIdentifier := latestMetadataValue(bucket.notifications, "issue_identifier", "issueIdentifier")
+	issueURL := latestMetadataValue(bucket.notifications, "issue_url", "issueUrl")
+
 	data := map[string]any{
-		"staffId":           bucket.staffID,
-		"userId":            bucket.userID,
-		"platform":          bucket.platform,
-		"sessionKey":        bucket.sessionKey,
-		"summaryLength":     cfg.SummaryLength,
-		"notificationCount": len(bucket.notifications),
-		"notifications":     notifications,
-		"combinedContent":   combinedNotifyContent(bucket.notifications),
-		"workspaceId":       latestMetadataValue(bucket.notifications, "workspace_id", "workspaceId"),
-		"issueId":           latestMetadataValue(bucket.notifications, "issue_id", "issueId"),
-		"issueTitle":        issueTitle,
-		"issueStatus":       latestMetadataValue(bucket.notifications, "issue_status", "issueStatus"),
-		"issueStatusTag":    latestMetadataValue(bucket.notifications, "issue_status_tag", "issueStatusTag"),
-		"issueCreateTime":   latestMetadataValue(bucket.notifications, "issue_create_time", "issueCreateTime"),
-		"issuePullRequests": latestMetadataValue(bucket.notifications, "issue_pull_requests", "issuePullRequests"),
-		"inboxType":         latestMetadataValue(bucket.notifications, "inbox_type", "inboxType"),
+		"staffId":             bucket.staffID,
+		"userId":              bucket.userID,
+		"platform":            bucket.platform,
+		"sessionKey":          bucket.sessionKey,
+		"summaryLength":       cfg.SummaryLength,
+		"notificationCount":   len(bucket.notifications),
+		"notifications":       notifications,
+		"combinedContent":     combinedNotifyContent(bucket.notifications),
+		"workspaceId":         latestMetadataValue(bucket.notifications, "workspace_id", "workspaceId"),
+		"issueId":             latestMetadataValue(bucket.notifications, "issue_id", "issueId"),
+		"issueIdentifier":     issueIdentifier,
+		"issueUrl":            issueURL,
+		"issueTitle":          issueTitle,
+		"issueStatus":         latestMetadataValue(bucket.notifications, "issue_status", "issueStatus"),
+		"issueStatusTag":      issueStatusTag,
+		"issueStatusTagShort": stripStatusPrefix(issueStatusTag),
+		"issueCreateTime":     issueCreateTime,
+		"issueElapsed":        humanizeIssueElapsed(issueCreateTime, time.Now()),
+		"issuePullRequests":   latestMetadataValue(bucket.notifications, "issue_pull_requests", "issuePullRequests"),
+		"inboxType":           latestMetadataValue(bucket.notifications, "inbox_type", "inboxType"),
 	}
 	return data
+}
+
+// stripStatusPrefix returns the label value with a leading "status:" (case
+// insensitive) trimmed off, e.g. "Status:Code-Review" -> "Code-Review".
+// Returns the input unchanged when no prefix matches.
+func stripStatusPrefix(tag string) string {
+	tag = strings.TrimSpace(tag)
+	if tag == "" {
+		return ""
+	}
+	if idx := strings.Index(tag, ":"); idx > 0 {
+		if strings.EqualFold(tag[:idx], "status") {
+			return strings.TrimSpace(tag[idx+1:])
+		}
+	}
+	return tag
+}
+
+// humanizeIssueElapsed renders the time since an issue was created as a
+// short Chinese duration suitable for embedding in the prompt. Returns ""
+// when createTime is empty or unparseable so the caller's template can omit
+// the line.
+func humanizeIssueElapsed(createTime string, now time.Time) string {
+	createTime = strings.TrimSpace(createTime)
+	if createTime == "" {
+		return ""
+	}
+	t, err := time.Parse(time.RFC3339, createTime)
+	if err != nil {
+		return ""
+	}
+	d := now.Sub(t)
+	if d < 0 {
+		return "刚刚"
+	}
+	days := int(d / (24 * time.Hour))
+	hours := int(d/time.Hour) % 24
+	minutes := int(d/time.Minute) % 60
+	switch {
+	case days > 0:
+		if hours > 0 {
+			return fmt.Sprintf("%d 天 %d 小时", days, hours)
+		}
+		return fmt.Sprintf("%d 天", days)
+	case hours > 0:
+		if minutes > 0 {
+			return fmt.Sprintf("%d 小时 %d 分钟", hours, minutes)
+		}
+		return fmt.Sprintf("%d 小时", hours)
+	case minutes > 0:
+		return fmt.Sprintf("%d 分钟", minutes)
+	default:
+		return "刚刚"
+	}
 }
 
 func combinedNotifyContent(notifications []notifySummaryNotification) string {
