@@ -15,19 +15,34 @@ import (
 )
 
 // defaultNotifySessionSummaryTemplate uses English imperatives (more reliable
-// for instruction following) while requiring a Chinese summary as output. The
-// "do not call tools" line is critical: without it, the agent typically tries
-// to discover the Multica CLI by grepping the filesystem for the issue UUID,
-// which can wander for minutes. Smoke tests show <10 s turn time with this
-// template, vs 4+ min when the agent is told to "use multica cli to query".
-const defaultNotifySessionSummaryTemplate = `You have received {{.notificationCount}} Multica issue notification(s) for issue {{.issueId}} (title: "{{.issueTitle}}", current status: {{.issueStatus}}).
+// for instruction following) while requiring a Chinese summary as output.
+//
+// The agent is allowed to call the Multica CLI for two specific reads
+// (issue metadata + comments) — both keyed by the issue_id already in the
+// prompt, so the agent does not need to discover anything. All other tool
+// calls (shell, grep, find, filesystem search) are explicitly forbidden to
+// avoid the 4+ minute "search for the UUID literally" wander that the
+// smoke tests reproduced when the instruction was open-ended.
+const defaultNotifySessionSummaryTemplate = `You have received {{.notificationCount}} Multica issue notification(s) for issue {{.issueId}}.
 
-Generate a concise progress summary of approximately {{.summaryLength}} Chinese characters based ONLY on the notification context below.
+Cached issue context (already known, do NOT re-fetch):
+- Title: "{{.issueTitle}}"
+- Status (DB): {{.issueStatus}}
+- Status tag (first "status:" label): {{.issueStatusTag}}
+- Linked pull/merge requests:
+{{.issuePullRequests}}
 
-Requirements (must follow ALL):
+Generate a concise progress summary of approximately {{.summaryLength}} Chinese characters.
+
+Allowed tool calls (each at most once, only if the cached context is insufficient):
+- ` + "`multica issue get {{.issueId}}`" + ` — fetch full issue metadata (assignee, labels, milestone, parents).
+- ` + "`multica issue comment list {{.issueId}}`" + ` — fetch the comment thread.
+
+Hard constraints (must follow ALL):
 - Write the summary in Chinese (中文). Do not output any English.
-- Merge related events by timeline, deduplicate, and highlight the most recent state transition.
-- DO NOT call multica, shell, grep, rg, find, ls, cat, or ANY external command. DO NOT search the filesystem or read any file. Use ONLY the notification context provided below.
+- DO NOT call shell, grep, rg, find, ls, cat, sed, awk, git, curl, or ANY command other than the two ` + "`multica`" + ` reads above. DO NOT search the filesystem or read any file.
+- Merge related events by timeline, deduplicate, and highlight the most recent state transition. If a status tag is present, mention it.
+- If pull/merge requests are listed, surface them in the summary (state + a short label).
 - Output the summary text directly. No preamble, no greeting, no meta phrases (e.g. "以下是总结", "Summary:", "好的", "I will now…").
 - End with exactly one line: "详情：multica issue {{.issueId}}"
 
@@ -462,7 +477,9 @@ func notifySummaryTemplateData(cfg NotifySessionSummaryConfig, bucket *notifySum
 		"issueId":           latestMetadataValue(bucket.notifications, "issue_id", "issueId"),
 		"issueTitle":        issueTitle,
 		"issueStatus":       latestMetadataValue(bucket.notifications, "issue_status", "issueStatus"),
+		"issueStatusTag":    latestMetadataValue(bucket.notifications, "issue_status_tag", "issueStatusTag"),
 		"issueCreateTime":   latestMetadataValue(bucket.notifications, "issue_create_time", "issueCreateTime"),
+		"issuePullRequests": latestMetadataValue(bucket.notifications, "issue_pull_requests", "issuePullRequests"),
 		"inboxType":         latestMetadataValue(bucket.notifications, "inbox_type", "inboxType"),
 	}
 	return data
