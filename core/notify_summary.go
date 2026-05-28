@@ -14,16 +14,24 @@ import (
 	"time"
 )
 
-const defaultNotifySessionSummaryTemplate = `收到了如下 Multica Issue 通知消息。请使用 multica cli 查询该 Issue 的当前实时状态和工作进度，生成一段长度约 {{.summaryLength}} 字的进度总结。直接输出总结报告，不要包含其他信息。
+// defaultNotifySessionSummaryTemplate uses English imperatives (more reliable
+// for instruction following) while requiring a Chinese summary as output. The
+// "do not call tools" line is critical: without it, the agent typically tries
+// to discover the Multica CLI by grepping the filesystem for the issue UUID,
+// which can wander for minutes. Smoke tests show <10 s turn time with this
+// template, vs 4+ min when the agent is told to "use multica cli to query".
+const defaultNotifySessionSummaryTemplate = `You have received {{.notificationCount}} Multica issue notification(s) for issue {{.issueId}} (title: "{{.issueTitle}}", current status: {{.issueStatus}}).
 
-Staff ID: {{.staffId}}
-Workspace ID: {{.workspaceId}}
-Issue ID: {{.issueId}}
-Issue Title: {{.issueTitle}}
-Issue Status: {{.issueStatus}}
-Issue Created At: {{.issueCreateTime}}
+Generate a concise progress summary of approximately {{.summaryLength}} Chinese characters based ONLY on the notification context below.
 
-通知上下文:
+Requirements (must follow ALL):
+- Write the summary in Chinese (中文). Do not output any English.
+- Merge related events by timeline, deduplicate, and highlight the most recent state transition.
+- DO NOT call multica, shell, grep, rg, find, ls, cat, or ANY external command. DO NOT search the filesystem or read any file. Use ONLY the notification context provided below.
+- Output the summary text directly. No preamble, no greeting, no meta phrases (e.g. "以下是总结", "Summary:", "好的", "I will now…").
+- End with exactly one line: "详情：multica issue {{.issueId}}"
+
+Notification context:
 {{.combinedContent}}`
 
 type NotifySessionSummaryConfig struct {
